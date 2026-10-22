@@ -20,8 +20,7 @@
 # No evidence files are created.
 #
 # WARNING:
-# Applying rules can interrupt connectivity.
-# Test with direct VM console access.
+# Use direct VM console access when applying firewall rules.
 # ============================================================
 
 set -Eeuo pipefail
@@ -60,10 +59,12 @@ error() {
 
 exit_script() {
     echo
-    echo "[INFO] Exiting firewall assessment."
+    echo "[INFO] Exiting MWCCDC Firewall Assessment."
     exit 0
 }
 
+# Read user input without automatically treating 4 or q
+# as an exit. Each menu handles those choices separately.
 read_input() {
     local variable="$1"
     local prompt="$2"
@@ -73,20 +74,34 @@ read_input() {
         exit_script
     fi
 
-    case "${answer,,}" in
-        exit|4)
-            exit_script
-            ;;
-    esac
-
     printf -v "$variable" '%s' "$answer"
 }
 
+# Return to main menu after Option 2.
 pause_menu() {
     local answer
+
     echo
-    read_input answer \
-        "Press Enter to return to menu (or exit): "
+    echo "----------------------------------------"
+    echo " Press 'q' or Enter to return to menu"
+    echo " Type 'exit' to quit the script"
+    echo "----------------------------------------"
+
+    while true; do
+        read_input answer "Selection: "
+
+        case "${answer,,}" in
+            q|"")
+                return
+                ;;
+            exit|4)
+                exit_script
+                ;;
+            *)
+                echo "Enter 'q' to return or 'exit' to quit."
+                ;;
+        esac
+    done
 }
 
 need_root() {
@@ -97,12 +112,13 @@ need_root() {
 }
 
 # ============================================================
-# FIREWALL DETECTION
+# FIREWALL BACKEND DETECTION
 # ============================================================
 
 detect_backend() {
     BACKEND="unsupported"
 
+    # Prefer firewalld when it is running.
     if has firewall-cmd &&
        firewall-cmd --state 2>/dev/null |
        grep -qx running; then
@@ -110,6 +126,7 @@ detect_backend() {
         return
     fi
 
+    # Check for active UFW.
     if has ufw &&
        ufw status 2>/dev/null |
        grep -qi '^Status: active'; then
@@ -117,8 +134,9 @@ detect_backend() {
         return
     fi
 
+    # Recognize iptables, including iptables-nft.
     if has iptables; then
-        if iptables -V | grep -q nf_tables; then
+        if iptables -V 2>/dev/null | grep -q nf_tables; then
             BACKEND="iptables (nf_tables)"
         else
             BACKEND="iptables"
@@ -140,15 +158,19 @@ show_scrollable() {
     output="$(mktemp)"
 
     {
+        "$@"
+
+        echo
         echo "========================================"
         echo " Press 'q' to return to the main menu"
         echo "========================================"
-        echo
-        "$@"
     } > "$output" 2>&1
 
     if has less; then
-        less -S -R "$output"
+        # -S: Do not wrap long lines
+        # -R: Preserve terminal formatting
+        # -+F: Disable automatic exit for short output
+        less -S -R -+F "$output"
     else
         cat "$output"
         pause_menu
@@ -176,13 +198,13 @@ host_info() {
 
 assess_firewall() {
     heading "FW01 CURRENT FIREWALL ASSESSMENT"
+
     host_info
 
     echo
     echo "--- Current IPv4 Firewall Rules ---"
 
     case "$BACKEND" in
-
         "iptables"|"iptables (nf_tables)")
             echo
             echo "[IPv4 INPUT]"
@@ -203,6 +225,7 @@ assess_firewall() {
                 echo
                 echo "Zone: $zone"
                 firewall-cmd --zone="$zone" --list-all
+
             done < <(
                 firewall-cmd --get-active-zones |
                 awk '/^[^[:space:]]/ {print $1}'
@@ -214,7 +237,7 @@ assess_firewall() {
             ;;
 
         nftables)
-            nft list ruleset
+            nft -4 list ruleset
             ;;
 
         *)
@@ -244,10 +267,24 @@ choose_profiles() {
     echo "Combine profiles using commas."
     echo "Example: mail,webserver"
     echo
+    echo "Enter 'q' to return to the main menu."
+    echo
 
-    read_input PROFILES "Profiles: "
+    local answer
+    read_input answer "Profiles: "
 
-    PROFILES="${PROFILES// /}"
+    case "${answer,,}" in
+        q)
+            info "Returning to main menu."
+            return 1
+            ;;
+        exit)
+            exit_script
+            ;;
+    esac
+
+    PROFILES="${answer// /}"
+    PROFILES="${PROFILES,,}"
 
     [[ -n "$PROFILES" ]] || {
         error "No profile selected."
@@ -264,27 +301,21 @@ choose_profiles() {
 
     for profile in "${selected[@]}"; do
         case "$profile" in
-
             webserver)
                 TCP_PORTS+=(80 443)
                 ;;
-
             mail)
                 TCP_PORTS+=(25 465 587 110 995 143 993)
                 ;;
-
             splunk)
                 TCP_PORTS+=(8000 8089 9997)
                 ;;
-
             dnsntp)
                 TCP_PORTS+=(53)
                 UDP_PORTS+=(53 123)
                 ;;
-
             wrkstn)
                 ;;
-
             *)
                 error "Unknown profile: $profile"
                 return 1
@@ -292,6 +323,7 @@ choose_profiles() {
         esac
     done
 
+    # Remove duplicate ports.
     if ((${#TCP_PORTS[@]})); then
         mapfile -t TCP_PORTS < <(
             printf '%s\n' "${TCP_PORTS[@]}" | sort -nu
@@ -306,33 +338,36 @@ choose_profiles() {
 }
 
 # ============================================================
-# IPTABLES - DIRECT INPUT RULES
+# IPTABLES - DIRECT IPv4 INPUT RULES
 # ============================================================
 
 apply_iptables() {
     local port
 
-    # Reset IPv4 INPUT rules.
+    # Set permissive policy before rebuilding rules.
     iptables -P INPUT ACCEPT
+
+    # Remove existing IPv4 INPUT rules.
     iptables -F INPUT
 
-    # Allow loopback.
+    # Allow loopback traffic.
     iptables -A INPUT -i lo -j ACCEPT
 
-    # Allow established and related traffic.
+    # Allow established and related connections.
     iptables -A INPUT -m conntrack \
         --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-    # Block inbound SSH.
-    iptables -A INPUT -p tcp --dport 22 -j DROP
+    # Explicitly block new inbound SSH on TCP 22.
+    iptables -A INPUT -p tcp \
+        --dport 22 -j DROP
 
-    # Allow required TCP ports.
+    # Allow selected TCP ports.
     for port in "${TCP_PORTS[@]}"; do
         iptables -A INPUT -p tcp \
             --dport "$port" -j ACCEPT
     done
 
-    # Allow required UDP ports.
+    # Allow selected UDP ports.
     for port in "${UDP_PORTS[@]}"; do
         iptables -A INPUT -p udp \
             --dport "$port" -j ACCEPT
@@ -341,7 +376,7 @@ apply_iptables() {
     # Allow IPv4 ICMP.
     iptables -A INPUT -p icmp -j ACCEPT
 
-    # Block all other inbound IPv4 traffic.
+    # Default deny for remaining inbound IPv4 traffic.
     iptables -P INPUT DROP
 
     info "IPv4 INPUT firewall rules applied."
@@ -368,11 +403,11 @@ apply_firewalld() {
     for zone in "${zones[@]}"; do
         info "Configuring zone: $zone"
 
-        # Remove SSH service allowance.
+        # Remove standard SSH service allowance.
         firewall-cmd --zone="$zone" \
             --remove-service=ssh 2>/dev/null || true
 
-        # Remove direct SSH port allowance.
+        # Remove explicit TCP 22 allowance.
         firewall-cmd --zone="$zone" \
             --remove-port=22/tcp 2>/dev/null || true
 
@@ -398,7 +433,7 @@ apply_firewalld() {
 }
 
 # ============================================================
-# OPTION 2 - HARDENING
+# OPTION 2 - APPLY HARDENING
 # ============================================================
 
 apply_hardening() {
@@ -434,16 +469,25 @@ apply_hardening() {
     echo
     echo "IPv6 is outside the scope of this script."
     echo
-
     warn "Active IPv4 firewall rules will change."
     warn "Use direct VM console access."
     echo
 
     local confirm
-    read_input confirm "Type APPLY to continue: "
+    read_input confirm "Type APPLY to continue (q = menu): "
+
+    case "${confirm,,}" in
+        q)
+            info "Returning to main menu."
+            return
+            ;;
+        exit)
+            exit_script
+            ;;
+    esac
 
     if [[ "$confirm" != "APPLY" ]]; then
-        info "Cancelled."
+        info "Hardening cancelled."
         return
     fi
 
@@ -466,6 +510,7 @@ apply_hardening() {
 
 verify_firewall() {
     heading "FW01 IPv4 FIREWALL VERIFICATION"
+
     host_info
 
     echo
@@ -475,7 +520,6 @@ verify_firewall() {
     echo "--- Applied IPv4 Firewall Rules ---"
 
     case "$BACKEND" in
-
         "iptables"|"iptables (nf_tables)")
             echo
             echo "[IPv4 INPUT]"
@@ -483,16 +527,29 @@ verify_firewall() {
             ;;
 
         firewalld)
+            echo
+            echo "[Active Zones]"
+            firewall-cmd --get-active-zones
+
             while IFS= read -r zone; do
                 [[ -n "$zone" ]] || continue
 
                 echo
                 echo "[Zone: $zone]"
                 firewall-cmd --zone="$zone" --list-all
+
             done < <(
                 firewall-cmd --get-active-zones |
                 awk '/^[^[:space:]]/ {print $1}'
             )
+            ;;
+
+        ufw)
+            ufw status verbose
+            ;;
+
+        nftables)
+            nft -4 list ruleset
             ;;
 
         *)
@@ -532,13 +589,13 @@ main() {
         echo "3) Verify firewall and display evidence"
         echo "4) Exit"
         echo
-        echo "Type 'exit' at any prompt to quit."
+        echo "Enter '4', 'q', or 'exit' to quit."
         echo
 
         local choice
         read_input choice "Select option: "
 
-        case "$choice" in
+        case "${choice,,}" in
             1)
                 show_scrollable assess_firewall
                 ;;
@@ -548,6 +605,9 @@ main() {
                 ;;
             3)
                 show_scrollable verify_firewall
+                ;;
+            4|q|exit)
+                exit_script
                 ;;
             *)
                 error "Invalid selection."
