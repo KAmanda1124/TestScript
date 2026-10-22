@@ -1,671 +1,603 @@
+
 #!/usr/bin/env bash
-# MWCCDC FW01 - Linux Host Firewall Assessment
-# Interactive menu, iptables enforcement, evidence and summary
-#
-# Run: sudo bash fw01-host-firewall-menu.sh
-# Preview: sudo bash fw01-host-firewall-menu.sh mail webserver --dry-run
-# Persist: sudo bash fw01-host-firewall-menu.sh --persist
-#
-# WARNING: New inbound IPv4 SSH connections are blocked.
-# Run from the VM console. IPv6 and Docker FORWARD/NAT are unchanged.
+# MWCCDC Linux Host Firewall
+# Ubuntu / Fedora / Oracle Linux
+# Runtime-only rules; no persistent configuration.
+# Run from the VM console, not over SSH.
 
-set -euo pipefail
+set -Eeuo pipefail
 
-# ================= CONFIGURATION =================
+CHAIN="MWCCDC_HOST"
+NFT_TABLE="mwccdc_host"
+FW_ZONE="mwccdc-host"
+EVIDENCE_DIR="./firewall-evidence"
 
-DEFAULT_MGMT_NETS=("172.20.240.0/24" "172.20.242.0/24")
-MGMT_NETS=("${DEFAULT_MGMT_NETS[@]}")
-
-ALLOW_PING=1
-SPLUNK_OPEN=0
-DRY_RUN=0
-MODE="apply"
-
+BACKEND=""
+IPT=""
+IP6T=""
 PROFILES=()
-EXTRA_TCP=()
-PUBLIC_TCP=()
-PUBLIC_UDP=()
-MGMT_TCP=()
-HAS_WRKSTN=0
+TCP_PORTS=()
+UDP_PORTS=()
 
 die() {
-    echo "ERROR: $*" >&2
+    echo "[ERROR] $*" >&2
     exit 1
 }
 
-valid_port() {
-    [[ "$1" =~ ^[1-9][0-9]*$ ]] || return 1
-    (( 10#$1 <= 65535 ))
+info() { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*"; }
+
+need_root() {
+    [[ $EUID -eq 0 ]] || die "Run with sudo."
 }
 
-valid_cidr() {
-    local value="$1" ip mask a b c d octet
+has() {
+    command -v "$1" >/dev/null 2>&1
+}
 
-    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
+active() {
+    systemctl is-active --quiet "$1" 2>/dev/null
+}
 
-    ip="${value%/*}"
-    mask="${value#*/}"
+ipv6_enabled() {
+    [[ -f /proc/net/if_inet6 ]] &&
+    [[ -n "$(cat /proc/net/if_inet6)" ]]
+}
 
-    [[ "$mask" =~ ^(0|[1-9][0-9]?)$ ]] || return 1
-    (( 10#$mask <= 32 )) || return 1
+# -----------------------------
+# Firewall detection
+# -----------------------------
 
-    IFS='.' read -r a b c d <<< "$ip"
+detect_backend() {
+    local -a managers=()
 
-    for octet in "$a" "$b" "$c" "$d"; do
-        [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
-        (( 10#$octet <= 255 )) || return 1
+    if active firewalld && has firewall-cmd; then
+        managers+=(firewalld)
+    fi
+
+    if has ufw && ufw status 2>/dev/null |
+        grep -qi '^Status: active'; then
+        managers+=(ufw)
+    fi
+
+    if active nftables && has nft; then
+        managers+=(nftables)
+    fi
+
+    if ((${#managers[@]} > 1)); then
+        BACKEND="conflict"
+        return
+    fi
+
+    if ((${#managers[@]} == 1)); then
+        BACKEND="${managers[0]}"
+        return
+    fi
+
+    # A running service is not the only way to
+    # manage firewall rules. Detect existing rules.
+    if has nft && nft list ruleset 2>/dev/null |
+        grep -Eq '^[[:space:]]*hook (input|forward|output)'; then
+        BACKEND="unmanaged-nft"
+        return
+    fi
+
+    if has iptables && iptables-save 2>/dev/null |
+        grep -Eq '^-[AI] (INPUT|FORWARD|OUTPUT) '; then
+        BACKEND="unmanaged-iptables"
+        return
+    fi
+
+    BACKEND="none"
+}
+
+show_system() {
+    echo
+    echo "========================================"
+    echo "         MWCCDC HOST FIREWALL"
+    echo "========================================"
+
+    echo "Hostname : $(hostname)"
+    echo "OS       : $(. /etc/os-release; echo "$PRETTY_NAME")"
+    echo "Kernel   : $(uname -r)"
+
+    detect_backend
+    echo "Manager  : $BACKEND"
+
+    if has iptables; then
+        echo "iptables : $(iptables -V)"
+    fi
+
+    echo
+    echo "IPv4 Interfaces:"
+    ip -br -4 addr || true
+
+    echo
+    echo "IPv6 Interfaces:"
+    ip -br -6 addr || true
+
+    echo "========================================"
+}
+
+# -----------------------------
+# Evidence collection
+# -----------------------------
+
+capture_evidence() {
+    local phase="$1"
+    local dir="$EVIDENCE_DIR/$phase"
+
+    mkdir -p "$dir"
+
+    date -Is > "$dir/timestamp.txt"
+    hostnamectl > "$dir/host.txt" 2>&1 || true
+    ip -br addr > "$dir/addresses.txt"
+    ip route > "$dir/routes.txt"
+    ip -6 route > "$dir/ipv6-routes.txt"
+    ss -tulpen > "$dir/listening.txt" 2>&1
+
+    if has iptables; then
+        iptables-save > "$dir/iptables.txt" 2>&1 || true
+        iptables -L -n -v > "$dir/iptables-counters.txt" 2>&1 || true
+    fi
+
+    if has ip6tables; then
+        ip6tables-save > "$dir/ip6tables.txt" 2>&1 || true
+    fi
+
+    if has nft; then
+        nft -a list ruleset > "$dir/nftables.txt" 2>&1 || true
+    fi
+
+    if has firewall-cmd; then
+        firewall-cmd --state > "$dir/firewalld-state.txt" 2>&1 || true
+        firewall-cmd --list-all-zones > "$dir/firewalld.txt" 2>&1 || true
+    fi
+
+    if has ufw; then
+        ufw status verbose > "$dir/ufw.txt" 2>&1 || true
+    fi
+
+    info "Evidence captured: $dir"
+}
+
+# -----------------------------
+# Service profiles
+# -----------------------------
+
+add_tcp() { TCP_PORTS+=("$@"); }
+add_udp() { UDP_PORTS+=("$@"); }
+
+build_profiles() {
+    TCP_PORTS=()
+    UDP_PORTS=()
+
+    local profile
+
+    for profile in "${PROFILES[@]}"; do
+        case "$profile" in
+            webserver)
+                add_tcp 80 443
+                ;;
+            mail)
+                add_tcp 25 465 587 110 995 143 993
+                ;;
+            splunk)
+                add_tcp 8000 8089 9997
+                ;;
+            dnsntp)
+                add_tcp 53
+                add_udp 53 123
+                ;;
+            wrkstn)
+                ;;
+            *)
+                die "Unknown profile: $profile"
+                ;;
+        esac
     done
-}
 
-dedupe() {
-    if (( $# > 0 )); then
-        printf '%s\n' "$@" | sort -nu
+    # Remove duplicates.
+    if ((${#TCP_PORTS[@]})); then
+        mapfile -t TCP_PORTS < <(
+            printf '%s\n' "${TCP_PORTS[@]}" | sort -nu
+        )
+    fi
+
+    if ((${#UDP_PORTS[@]})); then
+        mapfile -t UDP_PORTS < <(
+            printf '%s\n' "${UDP_PORTS[@]}" | sort -nu
+        )
     fi
 }
 
-usage() {
-    cat <<'HELP'
-MWCCDC FW01 - Linux Host Firewall
+choose_profiles() {
+    echo
+    echo "Available profiles:"
+    echo "  webserver : TCP 80,443"
+    echo "  mail      : TCP 25,465,587,110,995,143,993"
+    echo "  splunk    : TCP 8000,8089,9997"
+    echo "  dnsntp    : TCP 53; UDP 53,123"
+    echo "  wrkstn    : No additional inbound ports"
+    echo
+    echo "Combine profiles with commas."
+    echo "Example: mail,webserver"
+    echo
 
-Usage:
-  sudo bash fw01-host-firewall-menu.sh
-  sudo bash fw01-host-firewall-menu.sh mail webserver
-  sudo bash fw01-host-firewall-menu.sh splunk --dry-run
-  sudo bash fw01-host-firewall-menu.sh --persist
+    local answer
+    read -r -p "Profiles: " answer
 
-Profiles:
-  webserver   TCP 80,443
-  mail        TCP 25,110
-  mail-full   TCP 25,465,587,110,995,143,993
-  splunk      TCP 8000,8089,9997
-  dnsntp      TCP 53, UDP 53,123
-  wrkstn      DHCP client replies
+    answer="${answer// /}"
+    IFS=',' read -r -a PROFILES <<< "$answer"
 
-Options:
-  --mgmt-nets CIDR[,CIDR]
-  --extra-tcp PORT[,PORT]
-  --splunk-open
-  --allow-ping
-  --no-ping
-  --dry-run
-  --preview
-  --persist
-  -h, --help
-HELP
+    ((${#PROFILES[@]})) || die "No profile selected."
+
+    build_profiles
 }
 
-# ================= INTERACTIVE MENU =================
-
-if [[ $# -eq 0 ]]; then
-
+show_plan() {
     echo
-    echo "=============================================="
-    echo "       MWCCDC FW01 - HOST FIREWALL"
-    echo "=============================================="
+    echo "========================================"
+    echo "           FIREWALL PLAN"
+    echo "========================================"
+    echo "Backend : $BACKEND"
+    echo "Profiles: ${PROFILES[*]}"
     echo
-    echo " Select your assigned Linux system:"
+    echo "Inbound TCP: ${TCP_PORTS[*]:-None}"
+    echo "Inbound UDP: ${UDP_PORTS[*]:-None}"
     echo
-    echo "   1) Ubuntu Ecom Server"
-    echo "   2) Fedora Webmail Server"
-    echo "   3) Oracle Linux Splunk Server"
-    echo "   4) Ubuntu Desktop Workstation"
+    echo "Inbound SSH: BLOCK"
+    echo "Loopback: ALLOW"
+    echo "Established traffic: ALLOW"
+    echo "Other inbound traffic: DROP"
+    echo "Outbound traffic: Existing policy"
+    echo "IPv6: Filtered when enabled"
     echo
-    echo "   0) Exit"
-    echo
-
-    read -r -p " Enter selection: " selection
-
-    case "$selection" in
-        1) set -- webserver ;;
-        2) set -- mail webserver ;;
-        3) set -- splunk ;;
-        4) set -- wrkstn ;;
-        0) echo "No changes made."; exit 0 ;;
-        *) die "Invalid selection. No changes made." ;;
-    esac
-fi
-
-# ================= ARGUMENT PARSING =================
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-
-        --mgmt-nets)
-            [[ $# -ge 2 ]] || die "Missing management networks"
-            IFS=',' read -ra MGMT_NETS <<< "$2"
-            (( ${#MGMT_NETS[@]} > 0 )) || die "No management networks"
-            shift 2
-            ;;
-
-        --extra-tcp)
-            [[ $# -ge 2 ]] || die "Missing TCP ports"
-            IFS=',' read -ra EXTRA_TCP <<< "$2"
-            (( ${#EXTRA_TCP[@]} > 0 )) || die "No extra TCP ports"
-            shift 2
-            ;;
-
-        --splunk-open)
-            SPLUNK_OPEN=1
-            shift
-            ;;
-
-        --allow-ping)
-            ALLOW_PING=1
-            shift
-            ;;
-
-        --no-ping)
-            ALLOW_PING=0
-            shift
-            ;;
-
-        --dry-run|--preview)
-            DRY_RUN=1
-            shift
-            ;;
-
-        --persist)
-            MODE="persist"
-            shift
-            ;;
-
-        -h|--help)
-            usage
-            exit 0
-            ;;
-
-        -*)
-            die "Unknown option: $1"
-            ;;
-
-        *)
-            PROFILES+=("$1")
-            shift
-            ;;
-    esac
-done
-
-[[ $EUID -eq 0 ]] || die "Run with sudo or as root."
-
-for cmd in iptables iptables-save ss; do
-    command -v "$cmd" >/dev/null 2>&1 || die "Missing command: $cmd"
-done
-
-# ================= PERSIST MODE =================
-
-firewall_manager_active() {
-    if command -v systemctl >/dev/null 2>&1 &&
-       systemctl is-active --quiet firewalld 2>/dev/null; then
-        return 0
-    fi
-
-    if command -v ufw >/dev/null 2>&1 &&
-       ufw status 2>/dev/null | grep -q '^Status: active'; then
-        return 0
-    fi
-
-    return 1
+    echo "Rules are runtime-only."
+    echo "========================================"
 }
 
-if [[ "$MODE" == "persist" ]]; then
+# -----------------------------
+# iptables backend
+# -----------------------------
 
-    if firewall_manager_active; then
-        die "firewalld or UFW is active. Resolve firewall manager conflicts."
-    fi
+apply_iptables_family() {
+    local cmd="$1"
+    local port
 
-    iptables -C INPUT -j MWCCDC_HOST 2>/dev/null ||
-        die "MWCCDC_HOST is not attached to INPUT."
+    "$cmd" -N "$CHAIN" 2>/dev/null || true
+    "$cmd" -F "$CHAIN"
 
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-        netfilter-persistent save
-        echo "Rules saved using netfilter-persistent."
+    "$cmd" -A "$CHAIN" -i lo -j ACCEPT
 
-    elif [[ -d /etc/sysconfig ]]; then
-        iptables-save > /etc/sysconfig/iptables
-        echo "Rules saved to /etc/sysconfig/iptables."
-        echo "Verify that the iptables service loads them at boot."
+    "$cmd" -A "$CHAIN" -m conntrack \
+        --ctstate ESTABLISHED,RELATED -j ACCEPT
 
+    # Explicit SSH block before service allowances.
+    "$cmd" -A "$CHAIN" -p tcp --dport 22 -j DROP
+
+    for port in "${TCP_PORTS[@]}"; do
+        "$cmd" -A "$CHAIN" -p tcp \
+            --dport "$port" -j ACCEPT
+    done
+
+    for port in "${UDP_PORTS[@]}"; do
+        "$cmd" -A "$CHAIN" -p udp \
+            --dport "$port" -j ACCEPT
+    done
+
+    # Allow basic ICMP for troubleshooting and
+    # IPv6 neighbor discovery.
+    if [[ "$cmd" == ip6tables ]]; then
+        "$cmd" -A "$CHAIN" -p ipv6-icmp -j ACCEPT
     else
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4
-        echo "Rules saved to /etc/iptables/rules.v4."
-        echo "WARNING: Configure a persistence service to load them at boot."
+        "$cmd" -A "$CHAIN" -p icmp -j ACCEPT
     fi
 
-    exit 0
-fi
+    "$cmd" -A "$CHAIN" -j DROP
 
-# ================= VALIDATION =================
-
-(( ${#PROFILES[@]} > 0 )) || {
-    usage
-    exit 1
+    "$cmd" -C INPUT -j "$CHAIN" 2>/dev/null ||
+        "$cmd" -I INPUT 1 -j "$CHAIN"
 }
 
-for port in "${EXTRA_TCP[@]}"; do
-    valid_port "$port" || die "Invalid TCP port: $port"
-done
+apply_iptables() {
+    has iptables || die "iptables is not installed."
 
-for net in "${MGMT_NETS[@]}"; do
-    valid_cidr "$net" || die "Invalid management network: $net"
-done
-
-# ================= BUILD FIREWALL PROFILES =================
-
-for profile in "${PROFILES[@]}"; do
-
-    case "$profile" in
-
-        webserver)
-            PUBLIC_TCP+=(80 443)
-            ;;
-
-        mail)
-            PUBLIC_TCP+=(25 110)
-            ;;
-
-        mail-full)
-            PUBLIC_TCP+=(25 465 587 110 995 143 993)
-            ;;
-
-        splunk)
-            if (( SPLUNK_OPEN )); then
-                PUBLIC_TCP+=(8000 8089 9997)
-            else
-                MGMT_TCP+=(8000 8089 9997)
-            fi
-            ;;
-
-        dnsntp)
-            PUBLIC_TCP+=(53)
-            PUBLIC_UDP+=(53 123)
-            ;;
-
-        wrkstn)
-            HAS_WRKSTN=1
-            ;;
-
-        *)
-            die "Unknown profile: $profile"
-            ;;
-    esac
-done
-
-PUBLIC_TCP+=("${EXTRA_TCP[@]}")
-
-mapfile -t PUBLIC_TCP < <(dedupe "${PUBLIC_TCP[@]}")
-mapfile -t PUBLIC_UDP < <(dedupe "${PUBLIC_UDP[@]}")
-mapfile -t MGMT_TCP < <(dedupe "${MGMT_TCP[@]}")
-
-# ================= REPORT DIRECTORY =================
-
-PROFILE_TAG="$(IFS=_; echo "${PROFILES[*]}")"
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-
-REPORT_DIR="/root/FW01_${PROFILE_TAG}_${TIMESTAMP}"
-
-mkdir -p "$REPORT_DIR"
-chmod 700 "$REPORT_DIR"
-
-SUMMARY="$REPORT_DIR/summary.txt"
-
-# ================= EVIDENCE COLLECTION =================
-
-capture() {
-    local stage="$1"
-
-    iptables -L INPUT -n -v --line-numbers \
-        > "$REPORT_DIR/${stage}-input.txt"
-
-    iptables -L OUTPUT -n -v --line-numbers \
-        > "$REPORT_DIR/${stage}-output.txt"
-
-    iptables-save \
-        > "$REPORT_DIR/${stage}-iptables.rules"
-
-    ss -tulnp \
-        > "$REPORT_DIR/${stage}-listening.txt"
-
-    if command -v firewall-cmd >/dev/null 2>&1; then
-        firewall-cmd --list-all \
-            > "$REPORT_DIR/${stage}-firewalld.txt" 2>&1 || true
+    if ipv6_enabled && ! has ip6tables; then
+        die "IPv6 is enabled but ip6tables is missing."
     fi
 
-    if command -v ufw >/dev/null 2>&1; then
-        ufw status verbose \
-            > "$REPORT_DIR/${stage}-ufw.txt" 2>&1 || true
+    apply_iptables_family iptables
+
+    if ipv6_enabled; then
+        apply_iptables_family ip6tables
     fi
 
-    if command -v nft >/dev/null 2>&1; then
-        nft list ruleset \
-            > "$REPORT_DIR/${stage}-nftables.txt" 2>&1 || true
-    fi
-
-    if command -v ip6tables-save >/dev/null 2>&1; then
-        ip6tables-save \
-            > "$REPORT_DIR/${stage}-ip6tables.rules" 2>&1 || true
-    fi
+    info "iptables rules applied."
 }
 
-# ================= CLEAN SUMMARY =================
+# -----------------------------
+# nftables backend
+# -----------------------------
 
-print_summary() {
-    local status="$1"
-    local port net
+apply_nftables() {
+    has nft || die "nft is not installed."
 
-    echo
-    echo "=================================================="
-    echo "          MWCCDC FW01 - FIREWALL RESULTS"
-    echo "=================================================="
-    echo
-    printf " Status:    %s\n" "$status"
-    printf " Host:      %s\n" "$(hostname)"
-    printf " Profiles:  %s\n" "${PROFILES[*]}"
-    echo
+    local tmp port
+    tmp="$(mktemp)"
+    trap 'rm -f "$tmp"' RETURN
 
-    echo "--------------------------------------------------"
-    echo " ALLOWED INBOUND TRAFFIC"
-    echo "--------------------------------------------------"
-    printf " %-8s %-16s %-20s\n" "PROTO" "PORT" "SOURCE"
-    echo "--------------------------------------------------"
+    {
+        echo "destroy table inet $NFT_TABLE"
+    } > /dev/null
 
-    for port in "${PUBLIC_TCP[@]}"; do
-        printf " %-8s %-16s %-20s\n" "TCP" "$port" "Any"
-    done
+    # Delete only our dedicated table if it exists.
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        nft delete table inet "$NFT_TABLE"
+    fi
 
-    for port in "${PUBLIC_UDP[@]}"; do
-        printf " %-8s %-16s %-20s\n" "UDP" "$port" "Any"
-    done
+    {
+        echo "table inet $NFT_TABLE {"
+        echo " chain input {"
+        echo "  type filter hook input priority -10; policy accept;"
+        echo "  iifname \"lo\" accept"
+        echo "  ct state established,related accept"
+        echo "  tcp dport 22 drop"
 
-    for port in "${MGMT_TCP[@]}"; do
-        for net in "${MGMT_NETS[@]}"; do
-            printf " %-8s %-16s %-20s\n" "TCP" "$port" "$net"
+        for port in "${TCP_PORTS[@]}"; do
+            echo "  tcp dport $port accept"
         done
+
+        for port in "${UDP_PORTS[@]}"; do
+            echo "  udp dport $port accept"
+        done
+
+        echo "  ip protocol icmp accept"
+        echo "  meta l4proto ipv6-icmp accept"
+        echo "  counter drop"
+        echo " }"
+        echo "}"
+    } > "$tmp"
+
+    nft -c -f "$tmp" || die "nftables validation failed."
+    nft -f "$tmp"
+
+    info "nftables rules applied."
+}
+
+# -----------------------------
+# firewalld backend
+# -----------------------------
+
+apply_firewalld() {
+    has firewall-cmd || die "firewall-cmd missing."
+
+    local -a interfaces=()
+    local iface port
+
+    # Dedicated runtime zone avoids modifying
+    # permanent firewalld configuration.
+    if ! firewall-cmd --get-zones |
+        tr ' ' '\n' | grep -qx "$FW_ZONE"; then
+        firewall-cmd --new-zone="$FW_ZONE"
+    fi
+
+    firewall-cmd --zone="$FW_ZONE" --set-target=DROP
+
+    firewall-cmd --zone="$FW_ZONE" \
+        --add-service=ssh >/dev/null 2>&1 || true
+    firewall-cmd --zone="$FW_ZONE" \
+        --remove-service=ssh >/dev/null 2>&1 || true
+
+    for port in "${TCP_PORTS[@]}"; do
+        firewall-cmd --zone="$FW_ZONE" \
+            --add-port="$port/tcp"
     done
 
-    if (( HAS_WRKSTN )); then
-        printf " %-8s %-16s %-20s\n" "UDP" "68" "DHCP replies"
-    fi
-
-    if (( ALLOW_PING )); then
-        printf " %-8s %-16s %-20s\n" "ICMP" "Echo request" "Any"
-    fi
-
-    echo
-    echo "--------------------------------------------------"
-    echo " SECURITY RULES"
-    echo "--------------------------------------------------"
-    echo " [BLOCK] New inbound SSH (TCP 22)"
-    echo " [BLOCK] Unmatched IPv4 inbound traffic"
-    echo " [ALLOW] Established/related connections"
-    echo " [ALLOW] Loopback traffic"
-    echo " [NOTE]  Outbound traffic unchanged"
-    echo " [NOTE]  IPv6 and Docker FORWARD/NAT unchanged"
-
-    echo
-    echo "--------------------------------------------------"
-    echo " EVIDENCE"
-    echo "--------------------------------------------------"
-    echo " Directory: $REPORT_DIR"
-
-    if [[ "$status" == "APPLIED" ]]; then
-        echo " Before:    before-iptables.rules"
-        echo " After:     after-iptables.rules"
-        echo " Changes:   firewall-changes.txt"
-        echo " Recovery:  recovery-commands.txt"
-    else
-        echo " Preview only - no changes applied"
-    fi
-
-    echo
-    echo "--------------------------------------------------"
-    echo " NEXT STEPS"
-    echo "--------------------------------------------------"
-
-    if [[ "$status" == "APPLIED" ]]; then
-        echo " 1. Verify scored services in NISE."
-        echo " 2. Test required network connections."
-        echo " 3. Review saved firewall evidence."
-        echo " 4. Persist rules only after verification."
-    else
-        echo " Review the plan before applying changes."
-    fi
-
-    echo
-    echo "=================================================="
-}
-
-# ================= DRY RUN =================
-
-if (( DRY_RUN )); then
-
-    ss -tulnp > "$REPORT_DIR/dry-run-listening.txt"
-
-    print_summary "DRY RUN" | tee "$SUMMARY"
-
-    exit 0
-fi
-
-# ================= PRE-CHANGE CHECKS =================
-
-echo
-echo "[1/5] Capturing current firewall configuration..."
-
-capture before
-
-if firewall_manager_active; then
-    die "firewalld or UFW is active. No changes applied."
-fi
-
-echo
-echo "Selected profiles: ${PROFILES[*]}"
-echo "New inbound SSH will be blocked."
-echo "Unmatched IPv4 inbound traffic will be dropped."
-echo
-echo "WARNING: Use the VM console for recovery."
-echo
-
-read -r -p "Apply these firewall rules? [y/N]: " confirm
-
-[[ "$confirm" =~ ^[Yy]([Ee][Ss])?$ ]] || {
-    echo "No changes made."
-    exit 0
-}
-
-# ================= CHAIN VALIDATION =================
-
-TEMP_CHAIN="MWCCDC_HOST_NEW"
-
-if iptables -L "$TEMP_CHAIN" -n >/dev/null 2>&1; then
-    die "Temporary chain already exists. Inspect before retrying."
-fi
-
-chain_has_external_references() {
-    local target="$1"
-
-    iptables -t filter -S | awk -v target="$target" '
-        $1 == "-A" && $2 != "INPUT" {
-            for (i = 3; i < NF; i++) {
-                if (($i == "-j" || $i == "-g") &&
-                    $(i+1) == target) {
-                    found = 1
-                }
-            }
-        }
-        END { exit(found ? 0 : 1) }
-    '
-}
-
-if iptables -L MWCCDC_HOST -n >/dev/null 2>&1; then
-
-    iptables -C INPUT -j MWCCDC_HOST 2>/dev/null ||
-        die "Existing chain is not attached to INPUT."
-
-    if chain_has_external_references MWCCDC_HOST; then
-        die "Existing chain has references outside INPUT."
-    fi
-fi
-
-# ================= BUILD FIREWALL =================
-
-echo "[2/5] Building firewall rules..."
-
-iptables -N "$TEMP_CHAIN"
-
-# Loopback
-iptables -A "$TEMP_CHAIN" -i lo -j ACCEPT
-
-# Invalid connections
-iptables -A "$TEMP_CHAIN" \
-    -m conntrack --ctstate INVALID -j DROP
-
-# Block new inbound SSH
-iptables -A "$TEMP_CHAIN" \
-    -p tcp --dport 22 \
-    -m conntrack --ctstate NEW -j DROP
-
-# Allow existing connections
-iptables -A "$TEMP_CHAIN" \
-    -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-# ICMP
-if (( ALLOW_PING )); then
-    iptables -A "$TEMP_CHAIN" \
-        -p icmp --icmp-type echo-request -j ACCEPT
-fi
-
-# Public TCP
-for port in "${PUBLIC_TCP[@]}"; do
-    iptables -A "$TEMP_CHAIN" \
-        -p tcp --dport "$port" \
-        -m conntrack --ctstate NEW -j ACCEPT
-done
-
-# Public UDP
-for port in "${PUBLIC_UDP[@]}"; do
-    iptables -A "$TEMP_CHAIN" \
-        -p udp --dport "$port" \
-        -m conntrack --ctstate NEW -j ACCEPT
-done
-
-# Restricted management TCP
-for port in "${MGMT_TCP[@]}"; do
-    for net in "${MGMT_NETS[@]}"; do
-        iptables -A "$TEMP_CHAIN" \
-            -p tcp -s "$net" --dport "$port" \
-            -m conntrack --ctstate NEW -j ACCEPT
+    for port in "${UDP_PORTS[@]}"; do
+        firewall-cmd --zone="$FW_ZONE" \
+            --add-port="$port/udp"
     done
-done
 
-# Workstation DHCP
-if (( HAS_WRKSTN )); then
-    iptables -A "$TEMP_CHAIN" \
-        -p udp --sport 67 --dport 68 -j ACCEPT
-fi
+    # Bind active non-loopback interfaces.
+    mapfile -t interfaces < <(
+        ip -o link show |
+        awk -F': ' '$2 !~ /^lo(@|$)/ {
+            split($2,a,"@"); print a[1]
+        }'
+    )
 
-# Default drop
-iptables -A "$TEMP_CHAIN" -j DROP
+    for iface in "${interfaces[@]}"; do
+        firewall-cmd --zone="$FW_ZONE" \
+            --change-interface="$iface"
+    done
 
-# ================= ACTIVATE FIREWALL =================
-
-echo "[3/5] Activating firewall..."
-
-if ! iptables -I INPUT 1 -j "$TEMP_CHAIN"; then
-    iptables -F "$TEMP_CHAIN" 2>/dev/null || true
-    iptables -X "$TEMP_CHAIN" 2>/dev/null || true
-    die "Failed to attach replacement chain."
-fi
-
-# Remove previous INPUT references
-while iptables -C INPUT -j MWCCDC_HOST 2>/dev/null; do
-    iptables -D INPUT -j MWCCDC_HOST ||
-        die "Failed to remove old INPUT reference."
-done
-
-# Remove old chain
-if iptables -L MWCCDC_HOST -n >/dev/null 2>&1; then
-
-    if chain_has_external_references MWCCDC_HOST; then
-        die "Old chain has unexpected external references."
-    fi
-
-    iptables -F MWCCDC_HOST
-    iptables -X MWCCDC_HOST
-fi
-
-# Rename replacement
-iptables -E "$TEMP_CHAIN" MWCCDC_HOST ||
-    die "Failed to rename replacement chain."
-
-# Verify attachment
-iptables -C INPUT -j MWCCDC_HOST ||
-    die "Firewall chain is not attached to INPUT."
-
-# ================= AFTER EVIDENCE =================
-
-echo "[4/5] Capturing updated firewall configuration..."
-
-capture after
-
-iptables -L MWCCDC_HOST -n -v --line-numbers \
-    > "$REPORT_DIR/after-host-rules.txt"
-
-# ================= CHANGE REPORT =================
-
-echo "[5/5] Generating firewall change report..."
-
-normalize_rules() {
-    sed -E \
-        -e '/^# Generated by /d' \
-        -e '/^# Completed on /d' \
-        -e 's/\[[0-9]+:[0-9]+\]//g' "$1"
+    info "Runtime firewalld zone applied."
 }
 
-diff -u \
-    <(normalize_rules "$REPORT_DIR/before-iptables.rules") \
-    <(normalize_rules "$REPORT_DIR/after-iptables.rules") \
-    > "$REPORT_DIR/firewall-changes.txt" || true
+# -----------------------------
+# UFW backend
+# -----------------------------
 
-# ================= RECOVERY COMMANDS =================
+apply_ufw() {
+    has ufw || die "ufw is not installed."
 
-cat > "$REPORT_DIR/recovery-commands.txt" <<'RECOVERY'
-MWCCDC FW01 - Manual Firewall Recovery
+    local port
 
-Run from the VM console.
+    # Do not reset UFW or remove unrelated rules.
+    # Existing allow rules may need manual review.
+    ufw deny in 22/tcp
 
-1. Verify the firewall chain:
+    for port in "${TCP_PORTS[@]}"; do
+        ufw allow in "$port/tcp"
+    done
 
-sudo iptables -L INPUT -n | grep MWCCDC_HOST
+    for port in "${UDP_PORTS[@]}"; do
+        ufw allow in "$port/udp"
+    done
 
-2. Save current rules:
+    ufw default deny incoming
+    ufw --force enable
 
-sudo iptables-save > /root/fw01-before-recovery.rules
+    info "UFW rules applied."
+}
 
-3. Remove the INPUT jump:
+# -----------------------------
+# Apply configuration
+# -----------------------------
 
-sudo iptables -D INPUT -j MWCCDC_HOST
+apply_firewall() {
+    detect_backend
 
-Repeat if multiple jumps exist.
+    case "$BACKEND" in
+        conflict|unmanaged-nft|unmanaged-iptables)
+            die "Existing or conflicting rules detected.
+Review them before selecting an enforcement backend."
+            ;;
+        none)
+            echo
+            echo "No active firewall manager detected."
+            echo "Select a backend:"
+            echo "1) iptables"
+            echo "2) nftables"
+            read -r -p "Choice: " choice
 
-4. Remove the firewall chain:
+            case "$choice" in
+                1) BACKEND="iptables" ;;
+                2) BACKEND="nftables" ;;
+                *) die "Invalid backend selection." ;;
+            esac
+            ;;
+    esac
 
-sudo iptables -F MWCCDC_HOST
-sudo iptables -X MWCCDC_HOST
+    choose_profiles
+    show_plan
 
-5. Verify:
+    echo
+    warn "This changes live firewall rules."
+    warn "Existing services may become unreachable."
+    read -r -p "Type APPLY to continue: " confirm
 
-sudo iptables -L INPUT -n -v
+    [[ "$confirm" == "APPLY" ]] || {
+        info "Cancelled."
+        return
+    }
 
-WARNING:
-Removing the MWCCDC_HOST chain restores the remaining
-INPUT rules, which may permit additional traffic.
-RECOVERY
+    capture_evidence before
 
-# ================= FINAL SUMMARY =================
+    case "$BACKEND" in
+        iptables)  apply_iptables ;;
+        nftables)  apply_nftables ;;
+        firewalld) apply_firewalld ;;
+        ufw)       apply_ufw ;;
+        *) die "Unsupported backend." ;;
+    esac
 
-print_summary "APPLIED" | tee "$SUMMARY"
+    capture_evidence after
 
-echo
-echo "Firewall configuration complete."
-echo "Detailed evidence saved successfully."
-echo
+    info "Firewall configuration completed."
+    info "Verify allowed and denied traffic from another VM."
+}
+
+# -----------------------------
+# Verification
+# -----------------------------
+
+verify_firewall() {
+    echo
+    echo "========== FIREWALL VERIFICATION =========="
+
+    detect_backend
+    echo "Detected manager: $BACKEND"
+
+    if has iptables; then
+        echo
+        echo "--- IPv4 iptables ---"
+        iptables -L -n -v
+    fi
+
+    if has ip6tables; then
+        echo
+        echo "--- IPv6 iptables ---"
+        ip6tables -L -n -v
+    fi
+
+    if has nft; then
+        echo
+        echo "--- nftables ---"
+        nft list ruleset
+    fi
+
+    if active firewalld; then
+        echo
+        echo "--- firewalld ---"
+        firewall-cmd --get-active-zones
+        firewall-cmd --list-all-zones
+    fi
+
+    if has ufw; then
+        echo
+        echo "--- UFW ---"
+        ufw status verbose
+    fi
+
+    echo
+    echo "--- Listening services ---"
+    ss -tulpen
+
+    echo
+    echo "Verification requires external connectivity tests."
+}
+
+# -----------------------------
+# Menu
+# -----------------------------
+
+main() {
+    need_root
+
+    while true; do
+        show_system
+
+        echo
+        echo "1) Assess current firewall"
+        echo "2) Apply service profile"
+        echo "3) Verify firewall configuration"
+        echo "4) Capture firewall evidence"
+        echo "5) View firewall logs"
+        echo "6) Exit"
+        echo
+
+        read -r -p "Select option: " choice
+
+        case "$choice" in
+            1)
+                verify_firewall
+                ;;
+            2)
+                apply_firewall
+                ;;
+            3)
+                verify_firewall
+                ;;
+            4)
+                capture_evidence manual
+                ;;
+            5)
+                echo "--- Recent firewall logs ---"
+                journalctl -k -n 100 --no-pager
+                ;;
+            6)
+                exit 0
+                ;;
+            *)
+                warn "Invalid selection."
+                ;;
+        esac
+
+        echo
+        read -r -p "Press Enter to continue..." _
+    done
+}
+
+main "$@"
