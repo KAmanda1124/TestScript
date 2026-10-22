@@ -1,23 +1,27 @@
 
 #!/usr/bin/env bash
 # ============================================================
-# MWCCDC FW01 - Firewall Assessment and Hardening
+# MWCCDC - FW01 IPv4 Firewall Assessment and Hardening
 #
-# Supports:
-#   Ubuntu: iptables / iptables-nft
-#   Fedora: firewalld
+# Supported:
+#   - Ubuntu: iptables / iptables-nft
+#   - Fedora: firewalld
 #
-# 1. Assess current firewall rules
-# 2. Apply service-specific hardening
-# 3. Verify firewall rules for screenshots
-# 4. Exit
+# Menu:
+#   1. Assess current IPv4 firewall rules
+#   2. Generate and apply hardening plan
+#   3. Verify firewall and display evidence
+#   4. Exit
 #
-# Runtime-only changes. No evidence files saved.
+# IPv6 is outside the scope of FW01.
+# No IPv6 rules are modified.
+#
+# Runtime-only firewall changes.
+# No evidence files are created.
 #
 # WARNING:
-# Applying a profile replaces INPUT filtering rules on
-# iptables hosts and modifies active firewalld zones.
-# Use VM console access and test before competition.
+# Applying rules can interrupt connectivity.
+# Test with direct VM console access.
 # ============================================================
 
 set -Eeuo pipefail
@@ -26,6 +30,10 @@ BACKEND=""
 PROFILES=""
 TCP_PORTS=()
 UDP_PORTS=()
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
 has() {
     command -v "$1" >/dev/null 2>&1
@@ -36,6 +44,18 @@ heading() {
     echo "========================================"
     echo " $1"
     echo "========================================"
+}
+
+info() {
+    echo "[INFO] $*"
+}
+
+warn() {
+    echo "[WARN] $*"
+}
+
+error() {
+    echo "[ERROR] $*" >&2
 }
 
 exit_script() {
@@ -64,8 +84,21 @@ read_input() {
 
 pause_menu() {
     local answer
-    read_input answer "Press Enter to return to menu (or exit): "
+    echo
+    read_input answer \
+        "Press Enter to return to menu (or exit): "
 }
+
+need_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "Run this script using sudo."
+        exit 1
+    fi
+}
+
+# ============================================================
+# FIREWALL DETECTION
+# ============================================================
 
 detect_backend() {
     BACKEND="unsupported"
@@ -98,13 +131,9 @@ detect_backend() {
     fi
 }
 
-host_info() {
-    detect_backend
-
-    echo "Hostname : $(hostname)"
-    echo "OS       : $(. /etc/os-release; echo "$PRETTY_NAME")"
-    echo "Firewall : $BACKEND"
-}
+# ============================================================
+# SCROLLABLE OUTPUT
+# ============================================================
 
 show_scrollable() {
     local output
@@ -123,15 +152,28 @@ show_scrollable() {
 }
 
 # ============================================================
-# OPTION 1 - ASSESS FIREWALL
+# HOST INFORMATION
+# ============================================================
+
+host_info() {
+    detect_backend
+
+    echo "Hostname : $(hostname)"
+    echo "OS       : $(. /etc/os-release; echo "$PRETTY_NAME")"
+    echo "Firewall : $BACKEND"
+    echo "Scope    : IPv4 only"
+}
+
+# ============================================================
+# OPTION 1 - ASSESS CURRENT FIREWALL
 # ============================================================
 
 assess_firewall() {
-    heading "CURRENT FIREWALL ASSESSMENT"
+    heading "FW01 CURRENT FIREWALL ASSESSMENT"
     host_info
 
     echo
-    echo "--- Current Firewall Rules ---"
+    echo "--- Current IPv4 Firewall Rules ---"
 
     case "$BACKEND" in
 
@@ -139,12 +181,6 @@ assess_firewall() {
             echo
             echo "[IPv4 INPUT]"
             iptables -S INPUT
-
-            if has ip6tables; then
-                echo
-                echo "[IPv6 INPUT]"
-                ip6tables -S INPUT
-            fi
             ;;
 
         firewalld)
@@ -153,9 +189,9 @@ assess_firewall() {
             firewall-cmd --get-active-zones
 
             echo
-            echo "[Zone Rules]"
+            echo "[Zone Configurations]"
 
-            while read -r zone; do
+            while IFS= read -r zone; do
                 [[ -n "$zone" ]] || continue
 
                 echo
@@ -181,8 +217,8 @@ assess_firewall() {
     esac
 
     echo
-    echo "--- Listening Services ---"
-    ss -tuln
+    echo "--- Listening IPv4 Services ---"
+    ss -4 -tuln
 }
 
 # ============================================================
@@ -208,7 +244,7 @@ choose_profiles() {
     PROFILES="${PROFILES// /}"
 
     [[ -n "$PROFILES" ]] || {
-        echo "[ERROR] No profile selected."
+        error "No profile selected."
         return 1
     }
 
@@ -222,23 +258,29 @@ choose_profiles() {
 
     for profile in "${selected[@]}"; do
         case "$profile" in
+
             webserver)
                 TCP_PORTS+=(80 443)
                 ;;
+
             mail)
                 TCP_PORTS+=(25 465 587 110 995 143 993)
                 ;;
+
             splunk)
                 TCP_PORTS+=(8000 8089 9997)
                 ;;
+
             dnsntp)
                 TCP_PORTS+=(53)
                 UDP_PORTS+=(53 123)
                 ;;
+
             wrkstn)
                 ;;
+
             *)
-                echo "[ERROR] Unknown profile: $profile"
+                error "Unknown profile: $profile"
                 return 1
                 ;;
         esac
@@ -261,60 +303,42 @@ choose_profiles() {
 # IPTABLES - DIRECT INPUT RULES
 # ============================================================
 
-apply_iptables_family() {
-    local cmd="$1"
+apply_iptables() {
     local port
 
-    # Reset INPUT rules.
-    "$cmd" -P INPUT ACCEPT
-    "$cmd" -F INPUT
+    # Reset IPv4 INPUT rules.
+    iptables -P INPUT ACCEPT
+    iptables -F INPUT
 
     # Allow loopback.
-    "$cmd" -A INPUT -i lo -j ACCEPT
+    iptables -A INPUT -i lo -j ACCEPT
 
-    # Allow established/related connections.
-    "$cmd" -A INPUT -m conntrack \
+    # Allow established and related traffic.
+    iptables -A INPUT -m conntrack \
         --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-    # Explicitly block SSH.
-    "$cmd" -A INPUT -p tcp --dport 22 -j DROP
+    # Block inbound SSH.
+    iptables -A INPUT -p tcp --dport 22 -j DROP
 
-    # Allow selected service ports.
+    # Allow required TCP ports.
     for port in "${TCP_PORTS[@]}"; do
-        "$cmd" -A INPUT -p tcp \
+        iptables -A INPUT -p tcp \
             --dport "$port" -j ACCEPT
     done
 
+    # Allow required UDP ports.
     for port in "${UDP_PORTS[@]}"; do
-        "$cmd" -A INPUT -p udp \
+        iptables -A INPUT -p udp \
             --dport "$port" -j ACCEPT
     done
 
-    # Preserve ICMP functionality.
-    if [[ "$cmd" == ip6tables ]]; then
-        "$cmd" -A INPUT -p ipv6-icmp -j ACCEPT
-    else
-        "$cmd" -A INPUT -p icmp -j ACCEPT
-    fi
+    # Allow IPv4 ICMP.
+    iptables -A INPUT -p icmp -j ACCEPT
 
-    # Block remaining inbound traffic.
-    "$cmd" -P INPUT DROP
-}
+    # Block all other inbound IPv4 traffic.
+    iptables -P INPUT DROP
 
-apply_iptables() {
-    if [[ -s /proc/net/if_inet6 ]] &&
-       ! has ip6tables; then
-        echo "[ERROR] IPv6 enabled but ip6tables unavailable."
-        return 1
-    fi
-
-    apply_iptables_family iptables
-
-    if [[ -s /proc/net/if_inet6 ]]; then
-        apply_iptables_family ip6tables
-    fi
-
-    echo "[OK] INPUT firewall rules applied."
+    info "IPv4 INPUT firewall rules applied."
 }
 
 # ============================================================
@@ -331,39 +355,40 @@ apply_firewalld() {
     )
 
     if ((${#zones[@]} == 0)); then
-        echo "[ERROR] No active firewalld zones."
+        error "No active firewalld zones found."
         return 1
     fi
 
     for zone in "${zones[@]}"; do
-        echo "[INFO] Configuring zone: $zone"
+        info "Configuring zone: $zone"
 
-        # Block SSH.
+        # Remove SSH service allowance.
         firewall-cmd --zone="$zone" \
             --remove-service=ssh 2>/dev/null || true
 
+        # Remove direct SSH port allowance.
         firewall-cmd --zone="$zone" \
             --remove-port=22/tcp 2>/dev/null || true
 
-        # Add required ports.
+        # Allow required TCP ports.
         for port in "${TCP_PORTS[@]}"; do
             firewall-cmd --zone="$zone" \
                 --add-port="$port/tcp"
         done
 
+        # Allow required UDP ports.
         for port in "${UDP_PORTS[@]}"; do
             firewall-cmd --zone="$zone" \
                 --add-port="$port/udp"
         done
 
-        # Explicitly block SSH.
+        # Block IPv4 SSH explicitly.
         firewall-cmd --zone="$zone" \
-            --add-rich-rule='rule port port="22" protocol="tcp" drop'
+            --add-rich-rule='rule family="ipv4" port port="22" protocol="tcp" drop'
     done
 
-    echo
-    echo "[OK] firewalld runtime rules updated."
-    echo "[WARN] Existing non-SSH allowances remain."
+    info "firewalld runtime rules updated."
+    warn "Existing non-SSH allowances remain unchanged."
 }
 
 # ============================================================
@@ -377,40 +402,42 @@ apply_hardening() {
         "iptables"|"iptables (nf_tables)"|firewalld)
             ;;
         *)
-            echo "[ERROR] Unsupported enforcement backend."
+            error "Automatic enforcement unsupported for $BACKEND."
             return
             ;;
     esac
 
     choose_profiles || return
 
-    heading "FIREWALL HARDENING PLAN"
+    heading "FW01 IPv4 FIREWALL HARDENING PLAN"
 
     echo "Hostname : $(hostname)"
     echo "Firewall : $BACKEND"
     echo "Profiles : $PROFILES"
     echo
-    echo "Inbound TCP: ${TCP_PORTS[*]:-None}"
-    echo "Inbound UDP: ${UDP_PORTS[*]:-None}"
+    echo "Required inbound TCP: ${TCP_PORTS[*]:-None}"
+    echo "Required inbound UDP: ${UDP_PORTS[*]:-None}"
     echo
-    echo "Controls:"
-    echo " - Allow loopback"
-    echo " - Allow established/related traffic"
-    echo " - Block SSH (TCP 22)"
+    echo "Planned controls:"
+    echo " - Allow loopback traffic"
+    echo " - Allow established/related connections"
+    echo " - Block inbound SSH (TCP 22)"
     echo " - Allow required service ports"
-    echo " - Restrict unnecessary inbound traffic"
-    echo " - Preserve outbound policy"
+    echo " - Restrict unnecessary inbound IPv4 traffic"
+    echo " - Preserve outbound firewall policy"
+    echo
+    echo "IPv6 is outside the scope of this script."
     echo
 
-    echo "[WARN] Active firewall rules will change."
-    echo "[WARN] Use VM console access."
+    warn "Active IPv4 firewall rules will change."
+    warn "Use direct VM console access."
     echo
 
     local confirm
     read_input confirm "Type APPLY to continue: "
 
     if [[ "$confirm" != "APPLY" ]]; then
-        echo "[INFO] Cancelled."
+        info "Cancelled."
         return
     fi
 
@@ -424,22 +451,22 @@ apply_hardening() {
     esac
 
     echo
-    echo "Use Option 3 to verify the configuration."
+    info "Use Option 3 to verify the configuration."
 }
 
 # ============================================================
-# OPTION 3 - VERIFICATION EVIDENCE
+# OPTION 3 - VERIFICATION AND EVIDENCE
 # ============================================================
 
 verify_firewall() {
-    heading "FW01 FIREWALL VERIFICATION"
+    heading "FW01 IPv4 FIREWALL VERIFICATION"
     host_info
 
     echo
     echo "Selected Profile: ${PROFILES:-Not selected in this session}"
 
     echo
-    echo "--- Applied Firewall Rules ---"
+    echo "--- Applied IPv4 Firewall Rules ---"
 
     case "$BACKEND" in
 
@@ -447,22 +474,15 @@ verify_firewall() {
             echo
             echo "[IPv4 INPUT]"
             iptables -S INPUT
-
-            if has ip6tables; then
-                echo
-                echo "[IPv6 INPUT]"
-                ip6tables -S INPUT
-            fi
             ;;
 
         firewalld)
-            while read -r zone; do
+            while IFS= read -r zone; do
                 [[ -n "$zone" ]] || continue
 
                 echo
                 echo "[Zone: $zone]"
                 firewall-cmd --zone="$zone" --list-all
-
             done < <(
                 firewall-cmd --get-active-zones |
                 awk '/^[^[:space:]]/ {print $1}'
@@ -476,9 +496,9 @@ verify_firewall() {
 
     echo
     echo "----------------------------------------"
-    echo "Firewall rules displayed for review."
+    echo "IPv4 firewall rules displayed for review."
     echo "External connectivity testing is required"
-    echo "to confirm permitted and blocked traffic."
+    echo "to confirm allowed and blocked traffic."
     echo "----------------------------------------"
 }
 
@@ -487,10 +507,7 @@ verify_firewall() {
 # ============================================================
 
 main() {
-    if [[ $EUID -ne 0 ]]; then
-        echo "[ERROR] Run using sudo."
-        exit 1
-    fi
+    need_root
 
     while true; do
         clear
@@ -502,6 +519,7 @@ main() {
         echo
         echo "Hostname : $(hostname)"
         echo "Firewall : $BACKEND"
+        echo "Scope    : IPv4 only"
         echo
         echo "1) Assess current firewall rules"
         echo "2) Generate and apply hardening plan"
@@ -526,7 +544,7 @@ main() {
                 show_scrollable verify_firewall
                 ;;
             *)
-                echo "[ERROR] Invalid selection."
+                error "Invalid selection."
                 pause_menu
                 ;;
         esac
