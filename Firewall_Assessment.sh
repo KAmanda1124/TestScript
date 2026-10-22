@@ -1,9 +1,8 @@
 
 #!/usr/bin/env bash
 # MWCCDC Linux Host Firewall
-# Ubuntu / Fedora / Oracle Linux
-# Runtime-only rules; no persistent configuration.
-# Run from the VM console, not over SSH.
+# Supports iptables, nftables, firewalld, and UFW
+# Runtime-only configuration
 
 set -Eeuo pipefail
 
@@ -13,8 +12,6 @@ FW_ZONE="mwccdc-host"
 EVIDENCE_DIR="./firewall-evidence"
 
 BACKEND=""
-IPT=""
-IP6T=""
 PROFILES=()
 TCP_PORTS=()
 UDP_PORTS=()
@@ -24,11 +21,12 @@ die() {
     exit 1
 }
 
-info() { echo "[INFO] $*"; }
-warn() { echo "[WARN] $*"; }
+info() {
+    echo "[INFO] $*"
+}
 
-need_root() {
-    [[ $EUID -eq 0 ]] || die "Run with sudo."
+warn() {
+    echo "[WARN] $*"
 }
 
 has() {
@@ -39,14 +37,50 @@ active() {
     systemctl is-active --quiet "$1" 2>/dev/null
 }
 
-ipv6_enabled() {
-    [[ -f /proc/net/if_inet6 ]] &&
-    [[ -n "$(cat /proc/net/if_inet6)" ]]
+need_root() {
+    [[ $EUID -eq 0 ]] || die "Run with sudo."
 }
 
-# -----------------------------
-# Firewall detection
-# -----------------------------
+ipv6_enabled() {
+    [[ -s /proc/net/if_inet6 ]]
+}
+
+pause_menu() {
+    echo
+    read -r -p "Press Enter to continue..." _
+}
+
+# ----------------------------------------
+# SCROLLABLE OUTPUT
+# ----------------------------------------
+
+show_scrollable() {
+    local title="$1"
+    shift
+
+    local output
+    output="$(mktemp)"
+
+    {
+        echo "========================================"
+        echo " $title"
+        echo "========================================"
+        echo
+        "$@"
+    } > "$output" 2>&1
+
+    if has less; then
+        less -S -R "$output"
+    else
+        cat "$output"
+    fi
+
+    rm -f "$output"
+}
+
+# ----------------------------------------
+# FIREWALL DETECTION
+# ----------------------------------------
 
 detect_backend() {
     local -a managers=()
@@ -74,10 +108,8 @@ detect_backend() {
         return
     fi
 
-    # A running service is not the only way to
-    # manage firewall rules. Detect existing rules.
     if has nft && nft list ruleset 2>/dev/null |
-        grep -Eq '^[[:space:]]*hook (input|forward|output)'; then
+        grep -Eq 'hook (input|forward|output)'; then
         BACKEND="unmanaged-nft"
         return
     fi
@@ -91,17 +123,20 @@ detect_backend() {
     BACKEND="none"
 }
 
+# ----------------------------------------
+# SYSTEM INFORMATION
+# ----------------------------------------
+
 show_system() {
+    detect_backend
+
     echo
     echo "========================================"
     echo "         MWCCDC HOST FIREWALL"
     echo "========================================"
-
     echo "Hostname : $(hostname)"
     echo "OS       : $(. /etc/os-release; echo "$PRETTY_NAME")"
     echo "Kernel   : $(uname -r)"
-
-    detect_backend
     echo "Manager  : $BACKEND"
 
     if has iptables; then
@@ -110,18 +145,15 @@ show_system() {
 
     echo
     echo "IPv4 Interfaces:"
-    ip -br -4 addr || true
+    ip -br -4 addr
 
     echo
-    echo "IPv6 Interfaces:"
-    ip -br -6 addr || true
-
     echo "========================================"
 }
 
-# -----------------------------
-# Evidence collection
-# -----------------------------
+# ----------------------------------------
+# EVIDENCE COLLECTION
+# ----------------------------------------
 
 capture_evidence() {
     local phase="$1"
@@ -161,12 +193,17 @@ capture_evidence() {
     info "Evidence captured: $dir"
 }
 
-# -----------------------------
-# Service profiles
-# -----------------------------
+# ----------------------------------------
+# SERVICE PROFILES
+# ----------------------------------------
 
-add_tcp() { TCP_PORTS+=("$@"); }
-add_udp() { UDP_PORTS+=("$@"); }
+add_tcp() {
+    TCP_PORTS+=("$@")
+}
+
+add_udp() {
+    UDP_PORTS+=("$@")
+}
 
 build_profiles() {
     TCP_PORTS=()
@@ -197,7 +234,6 @@ build_profiles() {
         esac
     done
 
-    # Remove duplicates.
     if ((${#TCP_PORTS[@]})); then
         mapfile -t TCP_PORTS < <(
             printf '%s\n' "${TCP_PORTS[@]}" | sort -nu
@@ -217,7 +253,7 @@ choose_profiles() {
     echo "  webserver : TCP 80,443"
     echo "  mail      : TCP 25,465,587,110,995,143,993"
     echo "  splunk    : TCP 8000,8089,9997"
-    echo "  dnsntp    : TCP 53; UDP 53,123"
+    echo "  dnsntp    : TCP/UDP 53, UDP 123"
     echo "  wrkstn    : No additional inbound ports"
     echo
     echo "Combine profiles with commas."
@@ -257,9 +293,9 @@ show_plan() {
     echo "========================================"
 }
 
-# -----------------------------
-# iptables backend
-# -----------------------------
+# ----------------------------------------
+# IPTABLES
+# ----------------------------------------
 
 apply_iptables_family() {
     local cmd="$1"
@@ -273,7 +309,6 @@ apply_iptables_family() {
     "$cmd" -A "$CHAIN" -m conntrack \
         --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-    # Explicit SSH block before service allowances.
     "$cmd" -A "$CHAIN" -p tcp --dport 22 -j DROP
 
     for port in "${TCP_PORTS[@]}"; do
@@ -286,8 +321,6 @@ apply_iptables_family() {
             --dport "$port" -j ACCEPT
     done
 
-    # Allow basic ICMP for troubleshooting and
-    # IPv6 neighbor discovery.
     if [[ "$cmd" == ip6tables ]]; then
         "$cmd" -A "$CHAIN" -p ipv6-icmp -j ACCEPT
     else
@@ -316,22 +349,16 @@ apply_iptables() {
     info "iptables rules applied."
 }
 
-# -----------------------------
-# nftables backend
-# -----------------------------
+# ----------------------------------------
+# NFTABLES
+# ----------------------------------------
 
 apply_nftables() {
     has nft || die "nft is not installed."
 
     local tmp port
     tmp="$(mktemp)"
-    trap 'rm -f "$tmp"' RETURN
 
-    {
-        echo "destroy table inet $NFT_TABLE"
-    } > /dev/null
-
-    # Delete only our dedicated table if it exists.
     if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
         nft delete table inet "$NFT_TABLE"
     fi
@@ -362,70 +389,55 @@ apply_nftables() {
     nft -c -f "$tmp" || die "nftables validation failed."
     nft -f "$tmp"
 
+    rm -f "$tmp"
+
     info "nftables rules applied."
 }
 
-# -----------------------------
-# firewalld backend
-# -----------------------------
+# ----------------------------------------
+# FIREWALLD
+# ----------------------------------------
 
 apply_firewalld() {
-    has firewall-cmd || die "firewall-cmd missing."
+    has firewall-cmd || die "firewall-cmd is missing."
 
-    local -a interfaces=()
-    local iface port
+    local zone port
 
-    # Dedicated runtime zone avoids modifying
-    # permanent firewalld configuration.
-    if ! firewall-cmd --get-zones |
-        tr ' ' '\n' | grep -qx "$FW_ZONE"; then
-        firewall-cmd --new-zone="$FW_ZONE"
-    fi
+    zone="$(firewall-cmd --get-default-zone)"
+    [[ -n "$zone" ]] || die "No default zone found."
 
-    firewall-cmd --zone="$FW_ZONE" --set-target=DROP
-
-    firewall-cmd --zone="$FW_ZONE" \
-        --add-service=ssh >/dev/null 2>&1 || true
-    firewall-cmd --zone="$FW_ZONE" \
-        --remove-service=ssh >/dev/null 2>&1 || true
+    warn "Using existing firewalld zone: $zone"
+    warn "Existing allowed services may remain active."
 
     for port in "${TCP_PORTS[@]}"; do
-        firewall-cmd --zone="$FW_ZONE" \
+        firewall-cmd --zone="$zone" \
             --add-port="$port/tcp"
     done
 
     for port in "${UDP_PORTS[@]}"; do
-        firewall-cmd --zone="$FW_ZONE" \
+        firewall-cmd --zone="$zone" \
             --add-port="$port/udp"
     done
 
-    # Bind active non-loopback interfaces.
-    mapfile -t interfaces < <(
-        ip -o link show |
-        awk -F': ' '$2 !~ /^lo(@|$)/ {
-            split($2,a,"@"); print a[1]
-        }'
-    )
+    firewall-cmd --zone="$zone" \
+        --add-rich-rule='rule family="ipv4" port port="22" protocol="tcp" drop'
 
-    for iface in "${interfaces[@]}"; do
-        firewall-cmd --zone="$FW_ZONE" \
-            --change-interface="$iface"
-    done
+    firewall-cmd --zone="$zone" \
+        --add-rich-rule='rule family="ipv6" port port="22" protocol="tcp" drop'
 
-    info "Runtime firewalld zone applied."
+    warn "Firewalld profile ports added."
+    warn "Review existing zone services and interface bindings."
 }
 
-# -----------------------------
-# UFW backend
-# -----------------------------
+# ----------------------------------------
+# UFW
+# ----------------------------------------
 
 apply_ufw() {
     has ufw || die "ufw is not installed."
 
     local port
 
-    # Do not reset UFW or remove unrelated rules.
-    # Existing allow rules may need manual review.
     ufw deny in 22/tcp
 
     for port in "${TCP_PORTS[@]}"; do
@@ -442,17 +454,18 @@ apply_ufw() {
     info "UFW rules applied."
 }
 
-# -----------------------------
-# Apply configuration
-# -----------------------------
+# ----------------------------------------
+# APPLY FIREWALL
+# ----------------------------------------
 
 apply_firewall() {
     detect_backend
 
     case "$BACKEND" in
         conflict|unmanaged-nft|unmanaged-iptables)
-            die "Existing or conflicting rules detected.
-Review them before selecting an enforcement backend."
+            warn "Existing or conflicting firewall rules detected."
+            warn "Review the rules before applying a profile."
+            return
             ;;
         none)
             echo
@@ -465,7 +478,7 @@ Review them before selecting an enforcement backend."
             case "$choice" in
                 1) BACKEND="iptables" ;;
                 2) BACKEND="nftables" ;;
-                *) die "Invalid backend selection." ;;
+                *) warn "Invalid backend selection."; return ;;
             esac
             ;;
     esac
@@ -475,7 +488,6 @@ Review them before selecting an enforcement backend."
 
     echo
     warn "This changes live firewall rules."
-    warn "Existing services may become unreachable."
     read -r -p "Type APPLY to continue: " confirm
 
     [[ "$confirm" == "APPLY" ]] || {
@@ -486,77 +498,99 @@ Review them before selecting an enforcement backend."
     capture_evidence before
 
     case "$BACKEND" in
-        iptables)  apply_iptables ;;
-        nftables)  apply_nftables ;;
+        iptables) apply_iptables ;;
+        nftables) apply_nftables ;;
         firewalld) apply_firewalld ;;
-        ufw)       apply_ufw ;;
+        ufw) apply_ufw ;;
         *) die "Unsupported backend." ;;
     esac
 
     capture_evidence after
 
     info "Firewall configuration completed."
-    info "Verify allowed and denied traffic from another VM."
 }
 
-# -----------------------------
-# Verification
-# -----------------------------
+# ----------------------------------------
+# ASSESSMENT AND VERIFICATION
+# ----------------------------------------
 
 verify_firewall() {
     echo
-    echo "========== FIREWALL VERIFICATION =========="
-
+    echo "--- Firewall Manager ---"
     detect_backend
-    echo "Detected manager: $BACKEND"
+    echo "$BACKEND"
+
+    echo
+    echo "--- Active Firewall Rules ---"
 
     if has iptables; then
         echo
-        echo "--- IPv4 iptables ---"
+        echo "[IPv4 iptables]"
         iptables -L -n -v
     fi
 
     if has ip6tables; then
         echo
-        echo "--- IPv6 iptables ---"
+        echo "[IPv6 iptables]"
         ip6tables -L -n -v
     fi
 
     if has nft; then
         echo
-        echo "--- nftables ---"
+        echo "[nftables]"
         nft list ruleset
     fi
 
     if active firewalld; then
         echo
-        echo "--- firewalld ---"
+        echo "[firewalld]"
         firewall-cmd --get-active-zones
         firewall-cmd --list-all-zones
     fi
 
     if has ufw; then
         echo
-        echo "--- UFW ---"
+        echo "[UFW]"
         ufw status verbose
     fi
 
     echo
-    echo "--- Listening services ---"
-    ss -tulpen
+    echo "--- Listening Services ---"
+    ss -tuln
 
     echo
     echo "Verification requires external connectivity tests."
 }
 
-# -----------------------------
-# Menu
-# -----------------------------
+# ----------------------------------------
+# FIREWALL LOGS
+# ----------------------------------------
+
+view_logs() {
+    echo
+    echo "--- Recent Firewall Logs ---"
+    echo
+
+    journalctl -k --since "1 hour ago" \
+        --no-pager -o short-iso 2>/dev/null |
+        grep -Ei \
+        'DROP|REJECT|DENIED|UFW BLOCK|FINAL_REJECT|MWCCDC' \
+        || true
+
+    echo
+    echo "No matching entries may mean firewall logging"
+    echo "is not configured."
+}
+
+# ----------------------------------------
+# MAIN MENU
+# ----------------------------------------
 
 main() {
     need_root
 
     while true; do
+        clear
         show_system
 
         echo
@@ -572,31 +606,36 @@ main() {
 
         case "$choice" in
             1)
-                verify_firewall
+                show_scrollable \
+                    "CURRENT FIREWALL ASSESSMENT" \
+                    verify_firewall
                 ;;
             2)
                 apply_firewall
+                pause_menu
                 ;;
             3)
-                verify_firewall
+                show_scrollable \
+                    "FIREWALL VERIFICATION" \
+                    verify_firewall
                 ;;
             4)
                 capture_evidence manual
+                pause_menu
                 ;;
             5)
-                echo "--- Recent firewall logs ---"
-                journalctl -k -n 100 --no-pager
+                show_scrollable \
+                    "RECENT FIREWALL LOGS" \
+                    view_logs
                 ;;
             6)
                 exit 0
                 ;;
             *)
                 warn "Invalid selection."
+                pause_menu
                 ;;
         esac
-
-        echo
-        read -r -p "Press Enter to continue..." _
     done
 }
 
