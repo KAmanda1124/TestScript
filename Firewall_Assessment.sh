@@ -1,22 +1,32 @@
 
 #!/usr/bin/env bash
 # ============================================================
-# MWCCDC - FW01 Host-Based Firewall Assessment
+# MWCCDC - FW01 Host Firewall Assessment and Hardening
 #
-# Purpose:
-#   1. Assess current firewall rules
-#   2. Generate a role-based firewall hardening plan
-#   3. Capture evidence for the FW01 inject
+# Supported: iptables, firewalld
+# Runtime-only changes
 #
-# This script is READ-ONLY.
-# It does not apply or remove firewall rules.
+# Functions:
+# 1. Assess current firewall
+# 2. Apply service-specific hardening
+# 3. Verify firewall configuration
+# 4. Capture before/after evidence
+#
+# WARNING:
+# Applying rules can interrupt network services.
+# Test in a disposable VM with console access.
 # ============================================================
 
 set -Eeuo pipefail
 
+CHAIN="MWCCDC_HOST"
 EVIDENCE_DIR="./firewall-evidence"
-BACKEND="unknown"
-PLAN_FILE=""
+
+BACKEND=""
+SESSION_DIR=""
+SELECTED_PROFILES=""
+TCP_PORTS=()
+UDP_PORTS=()
 
 has() {
     command -v "$1" >/dev/null 2>&1
@@ -24,7 +34,7 @@ has() {
 
 pause_menu() {
     echo
-    read -r -p "Press Enter to return to menu..." _
+    read -r -p "Press Enter to continue..." _
 }
 
 heading() {
@@ -34,9 +44,57 @@ heading() {
     echo "========================================"
 }
 
-# ------------------------------------------------------------
-# Scrollable output
-# ------------------------------------------------------------
+error() {
+    echo "[ERROR] $*" >&2
+}
+
+info() {
+    echo "[INFO] $*"
+}
+
+warn() {
+    echo "[WARN] $*"
+}
+
+need_root() {
+    [[ $EUID -eq 0 ]] || {
+        error "Run using sudo."
+        exit 1
+    }
+}
+
+# ============================================================
+# FIREWALL DETECTION
+# ============================================================
+
+detect_backend() {
+    BACKEND="unknown"
+
+    if has firewall-cmd &&
+       firewall-cmd --state 2>/dev/null |
+       grep -qx running; then
+        BACKEND="firewalld"
+        return
+    fi
+
+    if has ufw &&
+       ufw status 2>/dev/null |
+       grep -qi '^Status: active'; then
+        BACKEND="ufw"
+        return
+    fi
+
+    if has iptables; then
+        BACKEND="iptables"
+        return
+    fi
+
+    BACKEND="unsupported"
+}
+
+# ============================================================
+# SCROLLABLE OUTPUT
+# ============================================================
 
 show_scrollable() {
     local title="$1"
@@ -60,51 +118,11 @@ show_scrollable() {
     rm -f "$output"
 }
 
-# ------------------------------------------------------------
-# Detect firewall manager
-# ------------------------------------------------------------
+# ============================================================
+# HOST INFORMATION
+# ============================================================
 
-detect_backend() {
-    BACKEND="unknown"
-
-    if has firewall-cmd &&
-       firewall-cmd --state 2>/dev/null | grep -qx running; then
-        BACKEND="firewalld"
-        return
-    fi
-
-    if has ufw &&
-       ufw status 2>/dev/null | grep -qi "^Status: active"; then
-        BACKEND="ufw"
-        return
-    fi
-
-    if has nft &&
-       systemctl is-active --quiet nftables 2>/dev/null; then
-        BACKEND="nftables"
-        return
-    fi
-
-    if has nft &&
-       nft list ruleset 2>/dev/null |
-       grep -Eq 'hook (input|forward|output)'; then
-        BACKEND="nftables (existing rules)"
-        return
-    fi
-
-    if has iptables; then
-        BACKEND="iptables (verify active rules)"
-        return
-    fi
-
-    BACKEND="not detected"
-}
-
-# ------------------------------------------------------------
-# Host information
-# ------------------------------------------------------------
-
-show_host() {
+host_info() {
     detect_backend
 
     echo "Hostname : $(hostname)"
@@ -112,18 +130,18 @@ show_host() {
     echo "Firewall : $BACKEND"
 }
 
-# ------------------------------------------------------------
-# Current firewall rules
-# ------------------------------------------------------------
+# ============================================================
+# FIREWALL ASSESSMENT
+# ============================================================
 
-show_firewall_rules() {
+assess_firewall() {
     detect_backend
 
     heading "CURRENT FIREWALL RULES"
-    show_host
+    host_info
 
     echo
-    echo "--- Firewall Configuration ---"
+    echo "--- Active Firewall Configuration ---"
 
     case "$BACKEND" in
 
@@ -133,240 +151,166 @@ show_firewall_rules() {
             firewall-cmd --get-active-zones
 
             echo
-            echo "Zone configuration:"
+            echo "Zone rules:"
 
-            local zone
-            while IFS= read -r zone; do
+            while read -r zone; do
                 [[ -n "$zone" ]] || continue
 
                 echo
                 echo "Zone: $zone"
                 firewall-cmd --zone="$zone" --list-all
+
             done < <(
                 firewall-cmd --get-active-zones |
                 awk '/^[^[:space:]]/ {print $1}'
             )
-
-            echo
-            echo "Default zone:"
-            firewall-cmd --get-default-zone
             ;;
 
         ufw)
             ufw status verbose
             ;;
 
-        nftables*)
-            nft list ruleset
-            ;;
-
-        iptables*)
+        iptables)
             echo
-            echo "IPv4 rules:"
+            echo "IPv4:"
             iptables -L -n -v
 
             if has ip6tables; then
                 echo
-                echo "IPv6 rules:"
+                echo "IPv6:"
                 ip6tables -L -n -v
             fi
             ;;
 
         *)
-            echo "No supported firewall manager detected."
+            echo "Unsupported firewall manager."
             ;;
     esac
 
     echo
     echo "--- Listening Services ---"
     ss -tuln
-
-    echo
-    echo "NOTE:"
-    echo "Allowed firewall ports are not necessarily"
-    echo "reachable from another host."
-    echo "External connectivity testing is required."
 }
 
-# ------------------------------------------------------------
-# Role-based hardening plan
-# ------------------------------------------------------------
+# ============================================================
+# SERVICE PROFILES
+# ============================================================
 
-show_profiles() {
+choose_profiles() {
     echo
-    echo "Available host profiles:"
+    echo "Available profiles:"
     echo
-    echo "  webserver : TCP 80,443"
-    echo "  mail      : TCP 25,465,587,110,995,143,993"
-    echo "  splunk    : TCP 8000,8089,9997"
-    echo "  dnsntp    : TCP/UDP 53, UDP 123"
-    echo "  wrkstn    : No additional inbound services"
+    echo " webserver : TCP 80,443"
+    echo " mail      : TCP 25,465,587,110,995,143,993"
+    echo " splunk    : TCP 8000,8089,9997"
+    echo " dnsntp    : TCP/UDP 53, UDP 123"
+    echo " wrkstn    : No additional inbound ports"
     echo
-    echo "Multiple profiles can be combined."
+    echo "Combine profiles using commas."
     echo "Example: mail,webserver"
-}
-
-generate_plan() {
-    local selection profile
-    local -a profiles tcp_ports udp_ports
-    local -A seen_tcp=()
-    local -A seen_udp=()
-
-    heading "FIREWALL HARDENING PLAN"
-    show_host
-    show_profiles
-
     echo
-    read -r -p "Enter profile(s): " selection
 
-    selection="${selection// /}"
+    read -r -p "Profiles: " SELECTED_PROFILES
 
-    [[ -n "$selection" ]] || {
-        echo "[ERROR] No profile selected."
-        return
+    SELECTED_PROFILES="${SELECTED_PROFILES// /}"
+
+    [[ -n "$SELECTED_PROFILES" ]] || {
+        error "No profile selected."
+        return 1
     }
 
-    IFS=',' read -r -a profiles <<< "$selection"
+    TCP_PORTS=()
+    UDP_PORTS=()
 
-    tcp_ports=()
-    udp_ports=()
+    local profile
+    local -a profiles
+
+    IFS=',' read -r -a profiles <<< "$SELECTED_PROFILES"
 
     for profile in "${profiles[@]}"; do
         case "$profile" in
+
             webserver)
-                tcp_ports+=(80 443)
+                TCP_PORTS+=(80 443)
                 ;;
+
             mail)
-                tcp_ports+=(25 465 587 110 995 143 993)
+                TCP_PORTS+=(25 465 587 110 995 143 993)
                 ;;
+
             splunk)
-                tcp_ports+=(8000 8089 9997)
+                TCP_PORTS+=(8000 8089 9997)
                 ;;
+
             dnsntp)
-                tcp_ports+=(53)
-                udp_ports+=(53 123)
+                TCP_PORTS+=(53)
+                UDP_PORTS+=(53 123)
                 ;;
+
             wrkstn)
                 ;;
+
             *)
-                echo "[ERROR] Unknown profile: $profile"
-                return
+                error "Unknown profile: $profile"
+                return 1
                 ;;
         esac
     done
 
-    local port
-    for port in "${tcp_ports[@]}"; do
-        seen_tcp["$port"]=1
-    done
-
-    for port in "${udp_ports[@]}"; do
-        seen_udp["$port"]=1
-    done
-
-    local tcp_text="None"
-    local udp_text="None"
-
-    if ((${#seen_tcp[@]})); then
-        tcp_text="$(
-            printf '%s\n' "${!seen_tcp[@]}" |
-            sort -n |
-            paste -sd, -
-        )"
+    if ((${#TCP_PORTS[@]})); then
+        mapfile -t TCP_PORTS < <(
+            printf '%s\n' "${TCP_PORTS[@]}" | sort -nu
+        )
     fi
 
-    if ((${#seen_udp[@]})); then
-        udp_text="$(
-            printf '%s\n' "${!seen_udp[@]}" |
-            sort -n |
-            paste -sd, -
-        )"
+    if ((${#UDP_PORTS[@]})); then
+        mapfile -t UDP_PORTS < <(
+            printf '%s\n' "${UDP_PORTS[@]}" | sort -nu
+        )
     fi
-
-    local plan
-    plan="$(
-        cat <<EOF
-========================================
-        FW01 FIREWALL HARDENING PLAN
-========================================
-
-Hostname : $(hostname)
-Firewall : $BACKEND
-Profiles : ${profiles[*]}
-
-REQUIRED INBOUND PORTS
-----------------------------------------
-TCP: $tcp_text
-UDP: $udp_text
-
-RECOMMENDED ACTIONS
-----------------------------------------
-1. Review all currently allowed inbound
-   ports and services.
-
-2. Restrict inbound traffic to only the
-   ports required for the host's role.
-
-3. Block unnecessary inbound SSH access
-   on Linux hosts.
-
-4. Allow established and related traffic.
-
-5. Preserve required loopback traffic.
-
-6. Review IPv4 and IPv6 firewall rules.
-
-7. Confirm required outbound connectivity
-   remains functional.
-
-8. Test permitted and blocked ports from
-   another host after remediation.
-
-9. Capture firewall rules before and
-   after any configuration changes.
-
-========================================
-This is a proposed hardening plan.
-No firewall rules have been modified.
-========================================
-EOF
-    )"
-
-    echo
-    echo "$plan"
-
-    mkdir -p "$EVIDENCE_DIR"
-    PLAN_FILE="$EVIDENCE_DIR/hardening-plan.txt"
-
-    printf '%s\n' "$plan" > "$PLAN_FILE"
-
-    echo
-    echo "[OK] Plan saved to: $PLAN_FILE"
 }
 
-# ------------------------------------------------------------
-# Capture evidence
-# ------------------------------------------------------------
+# ============================================================
+# HARDENING PLAN
+# ============================================================
 
-capture_evidence() {
-    local timestamp directory
+show_plan() {
+    heading "FIREWALL HARDENING PLAN"
 
-    timestamp="$(date +%Y%m%d-%H%M%S)"
-    directory="$EVIDENCE_DIR/$timestamp"
+    echo "Hostname : $(hostname)"
+    echo "Firewall : $BACKEND"
+    echo "Profiles : $SELECTED_PROFILES"
+    echo
+    echo "Required inbound TCP: ${TCP_PORTS[*]:-None}"
+    echo "Required inbound UDP: ${UDP_PORTS[*]:-None}"
+    echo
+    echo "Security controls:"
+    echo " - Allow loopback traffic"
+    echo " - Allow established/related connections"
+    echo " - Block inbound SSH (TCP 22)"
+    echo " - Allow selected service ports"
+    echo " - Drop other inbound traffic"
+    echo " - Preserve existing outbound policy"
+    echo
+    echo "Changes are runtime-only."
+}
+
+# ============================================================
+# EVIDENCE COLLECTION
+# ============================================================
+
+capture_phase() {
+    local phase="$1"
+    local directory="$SESSION_DIR/$phase"
 
     mkdir -p "$directory"
 
-    heading "CAPTURE FIREWALL EVIDENCE"
-
     date -Is > "$directory/timestamp.txt"
-    hostname > "$directory/hostname.txt"
+    host_info > "$directory/host.txt"
+    ip -br addr > "$directory/network.txt"
+    ss -tuln > "$directory/listening.txt"
 
-    show_host > "$directory/host-information.txt"
-
-    ip -br addr > "$directory/network-interfaces.txt"
-    ss -tuln > "$directory/listening-services.txt"
-
-    show_firewall_rules > "$directory/current-firewall-rules.txt" 2>&1
+    assess_firewall > "$directory/firewall-rules.txt" 2>&1
 
     if has iptables; then
         iptables-save > "$directory/iptables.txt" 2>&1 || true
@@ -385,61 +329,256 @@ capture_evidence() {
             > "$directory/firewalld-zones.txt" 2>&1 || true
     fi
 
-    if has ufw; then
-        ufw status verbose \
-            > "$directory/ufw.txt" 2>&1 || true
-    fi
-
-    if [[ -f "$EVIDENCE_DIR/hardening-plan.txt" ]]; then
-        cp "$EVIDENCE_DIR/hardening-plan.txt" \
-            "$directory/hardening-plan.txt"
-    fi
-
-    echo "[OK] Firewall evidence captured."
-    echo
-    echo "Directory: $directory"
-    echo
-    echo "Evidence includes:"
-    echo " - Host information"
-    echo " - Network interfaces"
-    echo " - Listening services"
-    echo " - Current firewall rules"
-    echo " - Available firewall configurations"
-
-    if [[ -f "$directory/hardening-plan.txt" ]]; then
-        echo " - Firewall hardening plan"
-    else
-        echo
-        echo "[NOTE] Generate a hardening plan using"
-        echo "Option 2 before capturing evidence."
-    fi
+    info "Captured $phase evidence."
 }
 
-# ------------------------------------------------------------
-# Main menu
-# ------------------------------------------------------------
+# ============================================================
+# IPTABLES ENFORCEMENT
+# ============================================================
+
+apply_iptables_family() {
+    local cmd="$1"
+    local port
+
+    "$cmd" -N "$CHAIN" 2>/dev/null || true
+    "$cmd" -F "$CHAIN"
+
+    "$cmd" -A "$CHAIN" -i lo -j ACCEPT
+
+    "$cmd" -A "$CHAIN" -m conntrack \
+        --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    "$cmd" -A "$CHAIN" -p tcp --dport 22 -j DROP
+
+    for port in "${TCP_PORTS[@]}"; do
+        "$cmd" -A "$CHAIN" -p tcp \
+            --dport "$port" -j ACCEPT
+    done
+
+    for port in "${UDP_PORTS[@]}"; do
+        "$cmd" -A "$CHAIN" -p udp \
+            --dport "$port" -j ACCEPT
+    done
+
+    if [[ "$cmd" == ip6tables ]]; then
+        "$cmd" -A "$CHAIN" -p ipv6-icmp -j ACCEPT
+    else
+        "$cmd" -A "$CHAIN" -p icmp -j ACCEPT
+    fi
+
+    "$cmd" -A "$CHAIN" -j DROP
+
+    "$cmd" -C INPUT -j "$CHAIN" 2>/dev/null ||
+        "$cmd" -I INPUT 1 -j "$CHAIN"
+}
+
+apply_iptables() {
+    has iptables || {
+        error "iptables not installed."
+        return 1
+    }
+
+    if [[ -s /proc/net/if_inet6 ]] && ! has ip6tables; then
+        error "IPv6 enabled but ip6tables missing."
+        return 1
+    fi
+
+    apply_iptables_family iptables
+
+    if [[ -s /proc/net/if_inet6 ]]; then
+        apply_iptables_family ip6tables
+    fi
+
+    info "iptables firewall profile applied."
+}
+
+# ============================================================
+# FIREWALLD ENFORCEMENT
+# ============================================================
+
+apply_firewalld() {
+    has firewall-cmd || {
+        error "firewall-cmd not installed."
+        return 1
+    }
+
+    # firewalld runtime direct rules use an independent
+    # chain to filter inbound traffic.
+    #
+    # NOTE: Direct-rule behavior depends on firewalld
+    # backend and should be tested carefully.
+
+    local port
+    local priority=0
+
+    firewall-cmd --direct --add-chain ipv4 filter "$CHAIN" \
+        2>/dev/null || true
+
+    firewall-cmd --direct --add-rule ipv4 filter INPUT \
+        "$priority" -j "$CHAIN" 2>/dev/null || true
+
+    firewall-cmd --direct --add-rule ipv4 filter "$CHAIN" \
+        0 -i lo -j ACCEPT
+
+    firewall-cmd --direct --add-rule ipv4 filter "$CHAIN" \
+        1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    firewall-cmd --direct --add-rule ipv4 filter "$CHAIN" \
+        2 -p tcp --dport 22 -j DROP
+
+    priority=10
+
+    for port in "${TCP_PORTS[@]}"; do
+        firewall-cmd --direct --add-rule ipv4 filter "$CHAIN" \
+            "$priority" -p tcp --dport "$port" -j ACCEPT
+        ((priority+=1))
+    done
+
+    for port in "${UDP_PORTS[@]}"; do
+        firewall-cmd --direct --add-rule ipv4 filter "$CHAIN" \
+            "$priority" -p udp --dport "$port" -j ACCEPT
+        ((priority+=1))
+    done
+
+    firewall-cmd --direct --add-rule ipv4 filter "$CHAIN" \
+        100 -j DROP
+
+    info "firewalld runtime direct rules applied."
+    warn "Verify active zone allowances and IPv6 separately."
+}
+
+# ============================================================
+# APPLY HARDENING
+# ============================================================
+
+apply_hardening() {
+    detect_backend
+
+    case "$BACKEND" in
+        iptables|firewalld)
+            ;;
+        *)
+            error "Automatic enforcement not supported for $BACKEND."
+            return
+            ;;
+    esac
+
+    choose_profiles || return
+    show_plan
+
+    echo
+    warn "This will change active firewall rules."
+    warn "Ensure you have console access."
+    echo
+    read -r -p "Type APPLY to continue: " confirm
+
+    [[ "$confirm" == "APPLY" ]] || {
+        info "Cancelled."
+        return
+    }
+
+    SESSION_DIR="$EVIDENCE_DIR/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$SESSION_DIR"
+
+    show_plan > "$SESSION_DIR/hardening-plan.txt"
+
+    capture_phase before
+
+    case "$BACKEND" in
+        iptables)
+            apply_iptables
+            ;;
+        firewalld)
+            apply_firewalld
+            ;;
+    esac
+
+    capture_phase after
+
+    info "Hardening process completed."
+    echo "Evidence: $SESSION_DIR"
+}
+
+# ============================================================
+# VERIFICATION
+# ============================================================
+
+verify_firewall() {
+    heading "FIREWALL VERIFICATION"
+
+    detect_backend
+
+    echo "Hostname : $(hostname)"
+    echo "Firewall : $BACKEND"
+
+    echo
+    echo "--- Active Firewall Rules ---"
+
+    case "$BACKEND" in
+        iptables)
+            iptables -L INPUT -n -v
+            iptables -L "$CHAIN" -n -v 2>/dev/null || true
+
+            if has ip6tables; then
+                echo
+                echo "IPv6:"
+                ip6tables -L INPUT -n -v
+                ip6tables -L "$CHAIN" -n -v 2>/dev/null || true
+            fi
+            ;;
+        firewalld)
+            firewall-cmd --get-active-zones
+            firewall-cmd --direct --get-all-rules
+            ;;
+    esac
+
+    echo
+    echo "--- Listening Services ---"
+    ss -tuln
+
+    echo
+    echo "External connectivity testing is required"
+    echo "to confirm allowed and blocked traffic."
+}
+
+# ============================================================
+# MANUAL EVIDENCE CAPTURE
+# ============================================================
+
+manual_capture() {
+    SESSION_DIR="$EVIDENCE_DIR/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$SESSION_DIR"
+
+    capture_phase verification
+
+    echo
+    info "Verification evidence saved:"
+    echo "$SESSION_DIR"
+}
+
+# ============================================================
+# MAIN MENU
+# ============================================================
 
 main() {
-    [[ $EUID -eq 0 ]] || {
-        echo "[ERROR] Run this script with sudo."
-        exit 1
-    }
+    need_root
 
     while true; do
         clear
         detect_backend
 
         echo "========================================"
-        echo "     MWCCDC FIREWALL ASSESSMENT"
+        echo "      MWCCDC FIREWALL ASSESSMENT"
         echo "========================================"
         echo
         echo "Hostname : $(hostname)"
         echo "Firewall : $BACKEND"
         echo
         echo "1) Assess current firewall rules"
-        echo "2) Generate firewall hardening plan"
-        echo "3) Capture verification evidence"
-        echo "4) Exit"
+        echo "2) Generate and apply hardening plan"
+        echo "3) Verify firewall configuration"
+        echo "4) Capture verification evidence"
+        echo "5) Exit"
         echo
 
         read -r -p "Select option: " choice
@@ -447,23 +586,27 @@ main() {
         case "$choice" in
             1)
                 show_scrollable \
-                    "FW01 CURRENT FIREWALL ASSESSMENT" \
-                    show_firewall_rules
+                    "CURRENT FIREWALL ASSESSMENT" \
+                    assess_firewall
                 ;;
             2)
-                generate_plan
+                apply_hardening
                 pause_menu
                 ;;
             3)
-                capture_evidence
-                pause_menu
+                show_scrollable \
+                    "FIREWALL VERIFICATION" \
+                    verify_firewall
                 ;;
             4)
-                echo "Exiting."
+                manual_capture
+                pause_menu
+                ;;
+            5)
                 exit 0
                 ;;
             *)
-                echo "[ERROR] Invalid selection."
+                error "Invalid option."
                 pause_menu
                 ;;
         esac
