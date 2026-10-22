@@ -3,24 +3,22 @@
 # ============================================================
 # MWCCDC - FW01 Firewall Assessment and Hardening
 #
-# Supported:
-#   - Ubuntu / iptables
-#   - Fedora / firewalld
+# Supports:
+#   - iptables / iptables-nft (Ubuntu)
+#   - firewalld (Fedora)
 #
-# Features:
+# Functions:
 #   1. Assess current firewall rules
-#   2. Generate and apply hardening plan
-#   3. Verify firewall configuration
-#   4. Display screenshot-ready evidence
-#   5. Exit
+#   2. Generate and apply a service profile
+#   3. Verify rules and display screenshot-ready evidence
+#   4. Exit
 #
-# Exit using 5 or any capitalization of "exit".
-#
-# Runtime-only firewall changes.
+# Changes are runtime-only.
 # No evidence files are created.
 #
 # WARNING:
-# Test on disposable VMs with console access.
+# Applying firewall rules can interrupt connectivity.
+# Use console access and test on disposable VMs first.
 # ============================================================
 
 set -Eeuo pipefail
@@ -33,7 +31,7 @@ TCP_PORTS=()
 UDP_PORTS=()
 
 # ============================================================
-# HELPER FUNCTIONS
+# GENERAL FUNCTIONS
 # ============================================================
 
 has() {
@@ -65,13 +63,11 @@ exit_script() {
     exit 0
 }
 
-# Accepts exit, EXIT, Exit, ExIt, etc.
 is_exit() {
     local answer="${1,,}"
-    [[ "$answer" == "exit" || "$answer" == "5" ]]
+    [[ "$answer" == "exit" || "$answer" == "4" ]]
 }
 
-# Read input and allow exiting at any prompt.
 read_input() {
     local variable="$1"
     local prompt="$2"
@@ -90,7 +86,6 @@ read_input() {
 
 pause_menu() {
     local answer
-
     echo
     read_input answer "Press Enter to return to menu (or exit): "
 }
@@ -103,35 +98,64 @@ need_root() {
 }
 
 # ============================================================
-# FIREWALL DETECTION
+# FIREWALL BACKEND DETECTION
 # ============================================================
 
 detect_backend() {
     BACKEND="unknown"
 
+    # firewalld takes precedence when actively running.
     if has firewall-cmd &&
-       firewall-cmd --state 2>/dev/null |
-       grep -qx running; then
+       firewall-cmd --state 2>/dev/null | grep -qx running; then
         BACKEND="firewalld"
         return
     fi
 
+    # Detect active UFW.
     if has ufw &&
-       ufw status 2>/dev/null |
-       grep -qi '^Status: active'; then
+       ufw status 2>/dev/null | grep -qi '^Status: active'; then
         BACKEND="ufw"
         return
     fi
 
+    # Existing MWCCDC chain means iptables is in use.
+    if has iptables &&
+       iptables -nL "$CHAIN" >/dev/null 2>&1; then
+
+        if iptables -V 2>/dev/null | grep -q 'nf_tables'; then
+            BACKEND="iptables (nf_tables)"
+        else
+            BACKEND="iptables"
+        fi
+        return
+    fi
+
+    # Check for iptables-nft-managed tables.
+    if has iptables && has nft &&
+       iptables -V 2>/dev/null | grep -q 'nf_tables' &&
+       nft list tables 2>/dev/null |
+       grep -Eq '^table (ip|ip6) filter$'; then
+
+        BACKEND="iptables (nf_tables)"
+        return
+    fi
+
+    # Detect standalone nftables only after iptables.
     if has nft &&
        nft list ruleset 2>/dev/null |
        grep -Eq 'hook (input|forward|output)'; then
+
         BACKEND="nftables"
         return
     fi
 
+    # Fall back to iptables if installed.
     if has iptables; then
-        BACKEND="iptables"
+        if iptables -V 2>/dev/null | grep -q 'nf_tables'; then
+            BACKEND="iptables (nf_tables)"
+        else
+            BACKEND="iptables"
+        fi
         return
     fi
 
@@ -189,6 +213,7 @@ assess_firewall() {
     echo "--- Current Firewall Rules ---"
 
     case "$BACKEND" in
+
         firewalld)
             echo
             echo "Active zones:"
@@ -217,11 +242,7 @@ assess_firewall() {
             ufw status verbose
             ;;
 
-        nftables)
-            nft list ruleset
-            ;;
-
-        iptables)
+        "iptables"|"iptables (nf_tables)")
             echo
             echo "IPv4:"
             iptables -L -n -v
@@ -231,6 +252,12 @@ assess_firewall() {
                 echo "IPv6:"
                 ip6tables -L -n -v
             fi
+            ;;
+
+        nftables)
+            echo
+            echo "Standalone nftables rules:"
+            nft list ruleset
             ;;
 
         *)
@@ -280,21 +307,27 @@ choose_profiles() {
 
     for profile in "${profiles[@]}"; do
         case "$profile" in
+
             webserver)
                 TCP_PORTS+=(80 443)
                 ;;
+
             mail)
                 TCP_PORTS+=(25 465 587 110 995 143 993)
                 ;;
+
             splunk)
                 TCP_PORTS+=(8000 8089 9997)
                 ;;
+
             dnsntp)
                 TCP_PORTS+=(53)
                 UDP_PORTS+=(53 123)
                 ;;
+
             wrkstn)
                 ;;
+
             *)
                 error "Unknown profile: $profile"
                 return 1
@@ -330,14 +363,14 @@ show_plan() {
     echo "Required inbound UDP: ${UDP_PORTS[*]:-None}"
     echo
     echo "Planned controls:"
-    echo " - Allow loopback"
-    echo " - Allow established/related traffic"
+    echo " - Allow loopback traffic"
+    echo " - Allow established/related connections"
     echo " - Block inbound SSH (TCP 22)"
     echo " - Allow required service ports"
     echo " - Drop other inbound traffic"
     echo " - Preserve outbound policy"
     echo
-    echo "Rules are runtime-only."
+    echo "Changes are runtime-only."
 }
 
 # ============================================================
@@ -398,7 +431,7 @@ apply_iptables() {
         apply_iptables_family ip6tables
     fi
 
-    info "iptables profile applied."
+    info "iptables firewall profile applied."
 }
 
 # ============================================================
@@ -421,7 +454,7 @@ apply_firewalld() {
     }
 
     warn "Using existing zone: $zone"
-    warn "Existing zone allowances may remain active."
+    warn "Existing allowances may remain active."
 
     for port in "${TCP_PORTS[@]}"; do
         firewall-cmd --zone="$zone" \
@@ -451,7 +484,7 @@ apply_hardening() {
     detect_backend
 
     case "$BACKEND" in
-        iptables|firewalld)
+        "iptables"|"iptables (nf_tables)"|firewalld)
             ;;
         *)
             error "Automatic enforcement unsupported for $BACKEND."
@@ -476,7 +509,7 @@ apply_hardening() {
     }
 
     case "$BACKEND" in
-        iptables)
+        "iptables"|"iptables (nf_tables)")
             apply_iptables
             ;;
         firewalld)
@@ -486,11 +519,11 @@ apply_hardening() {
 
     echo
     info "Firewall commands completed."
-    info "Use Option 3 to inspect the applied rules."
+    info "Use Option 3 to verify the applied rules."
 }
 
 # ============================================================
-# OPTION 3 - VERIFY FIREWALL
+# OPTION 3 - VERIFICATION AND EVIDENCE
 # ============================================================
 
 verify_firewall() {
@@ -499,77 +532,11 @@ verify_firewall() {
     host_info
 
     echo
-    echo "--- Active Firewall Rules ---"
+    echo "--- Applied Firewall Rules ---"
 
     case "$BACKEND" in
-        iptables)
-            echo
-            echo "IPv4 INPUT:"
-            iptables -L INPUT -n -v
 
-            echo
-            echo "MWCCDC_HOST:"
-            iptables -L "$CHAIN" -n -v 2>/dev/null ||
-                echo "Custom chain not found."
-
-            if has ip6tables; then
-                echo
-                echo "IPv6 INPUT:"
-                ip6tables -L INPUT -n -v
-
-                echo
-                echo "IPv6 MWCCDC_HOST:"
-                ip6tables -L "$CHAIN" -n -v 2>/dev/null ||
-                    echo "Custom chain not found."
-            fi
-            ;;
-
-        firewalld)
-            echo
-            echo "Active zones:"
-            firewall-cmd --get-active-zones
-
-            echo
-            echo "Zone configuration:"
-            firewall-cmd --list-all
-
-            echo
-            echo "Runtime direct rules:"
-            firewall-cmd --direct --get-all-rules
-            ;;
-
-        *)
-            echo "Unsupported verification backend."
-            ;;
-    esac
-
-    echo
-    echo "--- Listening Services ---"
-    ss -tuln
-
-    echo
-    echo "External connectivity tests are required"
-    echo "to verify allowed and blocked traffic."
-}
-
-# ============================================================
-# OPTION 4 - SCREENSHOT-READY EVIDENCE
-# ============================================================
-
-display_evidence() {
-    detect_backend
-
-    heading "FW01 VERIFICATION EVIDENCE"
-
-    echo "Hostname : $(hostname)"
-    echo "OS       : $(. /etc/os-release; echo "$PRETTY_NAME")"
-    echo "Firewall : $BACKEND"
-
-    echo
-    echo "--- Current Firewall Configuration ---"
-
-    case "$BACKEND" in
-        iptables)
+        "iptables"|"iptables (nf_tables)")
             echo
             echo "[IPv4 INPUT]"
             iptables -S INPUT
@@ -613,30 +580,18 @@ display_evidence() {
                 firewall-cmd --get-active-zones |
                 awk '/^[^[:space:]]/ {print $1}'
             )
-
-            echo
-            echo "[Runtime Direct Rules]"
-            firewall-cmd --direct --get-all-rules
-            ;;
-
-        ufw)
-            ufw status verbose
-            ;;
-
-        nftables)
-            nft list ruleset
             ;;
 
         *)
-            echo "[WARN] Unsupported firewall manager."
+            echo "Unsupported verification backend."
             ;;
     esac
 
     echo
     echo "----------------------------------------"
-    echo "Current firewall rules displayed."
-    echo "External connectivity tests are still"
-    echo "required to confirm effective filtering."
+    echo "Rule configuration displayed."
+    echo "External connectivity testing is required"
+    echo "to confirm allowed and blocked traffic."
     echo "----------------------------------------"
 }
 
@@ -660,9 +615,8 @@ main() {
         echo
         echo "1) Assess current firewall rules"
         echo "2) Generate and apply hardening plan"
-        echo "3) Verify firewall configuration"
-        echo "4) Display verification evidence"
-        echo "5) Exit"
+        echo "3) Verify firewall and display evidence"
+        echo "4) Exit"
         echo
         echo "Type 'exit' at any prompt to quit."
         echo
@@ -682,12 +636,8 @@ main() {
                 ;;
             3)
                 show_scrollable \
-                    "FIREWALL VERIFICATION" \
+                    "FW01 FIREWALL VERIFICATION" \
                     verify_firewall
-                ;;
-            4)
-                display_evidence
-                pause_menu
                 ;;
             *)
                 error "Invalid selection."
