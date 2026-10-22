@@ -79,18 +79,15 @@ read_input() {
 
 # Return to main menu after Option 2.
 pause_menu() {
-    local answer
-
-    echo
-    echo "----------------------------------------"
-    echo " Press 'q' or Enter to return to menu"
-    echo " Type 'exit' to quit the script"
-    echo "----------------------------------------"
+    local user_response=""
 
     while true; do
-        read_input answer "Selection: "
+        echo
+        IFS= read -r -p \
+            "Press 'q' or Enter to return to the main menu: " \
+            user_response || exit_script
 
-        case "${answer,,}" in
+        case "${user_response,,}" in
             q|"")
                 return
                 ;;
@@ -98,7 +95,7 @@ pause_menu() {
                 exit_script
                 ;;
             *)
-                echo "Enter 'q' to return or 'exit' to quit."
+                echo "Invalid selection. Enter 'q' or press Enter."
                 ;;
         esac
     done
