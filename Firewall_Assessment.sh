@@ -145,10 +145,6 @@ show_scrollable() {
         echo "========================================"
         echo
         "$@"
-        echo
-        echo "----------------------------------------"
-        echo " Press 'q' to return to the main menu"
-        echo "----------------------------------------"
     } > "$output" 2>&1
 
     if has less; then
