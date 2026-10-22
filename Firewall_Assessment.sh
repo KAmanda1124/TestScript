@@ -68,13 +68,13 @@ exit_script() {
 read_input() {
     local variable="$1"
     local prompt="$2"
-    local answer
+    local user_response=""
 
-    if ! IFS= read -r -p "$prompt" answer; then
+    if ! IFS= read -r -p "$prompt" user_response; then
         exit_script
     fi
 
-    printf -v "$variable" '%s' "$answer"
+    printf -v "$variable" '%s' "$user_response"
 }
 
 # Return to main menu after Option 2.
