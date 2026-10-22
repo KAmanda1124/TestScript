@@ -139,10 +139,20 @@ show_scrollable() {
     local output
     output="$(mktemp)"
 
-    "$@" > "$output" 2>&1
+    {
+        echo "========================================"
+        echo " Press 'q' to return to the main menu"
+        echo "========================================"
+        echo
+        "$@"
+        echo
+        echo "----------------------------------------"
+        echo " Press 'q' to return to the main menu"
+        echo "----------------------------------------"
+    } > "$output" 2>&1
 
     if has less; then
-        less -S "$output"
+        less -S -R "$output"
     else
         cat "$output"
         pause_menu
