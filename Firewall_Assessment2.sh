@@ -204,7 +204,7 @@ scoring_menu() {
         echo "           SCORED SERVICE CHECK"
         echo "=========================================="
         echo "1) E-commerce"
-        echo "2) Roundcube Webmail"
+        echo "2) Webmail"
         echo "3) Splunk"
         echo "4) Workstation"
         echo "q) Return to Main Menu"
