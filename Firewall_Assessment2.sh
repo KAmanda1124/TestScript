@@ -283,7 +283,7 @@ while true; do
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Configure E-commerce"
-    echo "3) Configure Roundcube Webmail"
+    echo "3) Configure Webmail"
     echo "4) Configure Splunk"
     echo "5) Configure Workstation"
     echo "6) Check Scored Services"
