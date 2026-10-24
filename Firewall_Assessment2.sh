@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # MWCCDC Linux Firewall Assessment
 # E-commerce, Roundcube Webmail, Splunk, Workstation
