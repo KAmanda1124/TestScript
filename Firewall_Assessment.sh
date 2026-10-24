@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # ============================================================
 # MWCCDC - FW01 IPv4 Firewall Assessment and Hardening
