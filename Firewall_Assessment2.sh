@@ -1,16 +1,17 @@
 
 #!/usr/bin/env bash
 # MWCCDC Linux Firewall Assessment
+# E-commerce, Roundcube Webmail, Splunk, Workstation
+# Built-in iptables chains only
+# No custom chains, flushing, or permanent saves
 
 set -uo pipefail
 
-# Require root
 if [[ $EUID -ne 0 ]]; then
-    echo "ERROR: Please run this script with sudo."
+    echo "ERROR: Run this script with sudo."
     exit 1
 fi
 
-# Check dependencies
 for cmd in iptables ss; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "ERROR: $cmd is not installed."
@@ -18,7 +19,6 @@ for cmd in iptables ss; do
     fi
 done
 
-# Return to main menu
 pause() {
     echo
     while true; do
@@ -29,10 +29,9 @@ pause() {
     done
 }
 
-# Display firewall information
 show_firewall() {
     echo
-    echo "========== FIREWALL STATUS =========="
+    echo "========== CURRENT FIREWALL RULES =========="
     iptables -L INPUT -n -v --line-numbers
 
     echo
@@ -50,7 +49,8 @@ show_firewall() {
     pause
 }
 
-# Add a rule only if it does not already exist
+# Add a rule directly to INPUT.
+# Existing matching rules are not duplicated.
 allow_rule() {
     local chain="$1"
     shift
@@ -67,124 +67,169 @@ allow_rule() {
     fi
 }
 
-# Configure firewall for selected Linux service
-configure_service() {
+# Service definitions
+get_ports() {
     local service="$1"
-    local port
-    local tcp_ports=(22)
+
+    TCP_PORTS=(22)
 
     case "$service" in
         ecommerce)
-            tcp_ports+=(80 443)
+            TCP_PORTS+=(80 443)
             ;;
         webmail)
-            tcp_ports+=(25 110 143 587)
+            # Roundcube, Postfix, Dovecot
+            TCP_PORTS+=(80 443 25 110 143 465 587 993 995)
             ;;
         splunk)
-            tcp_ports+=(8000 8089 9997)
+            TCP_PORTS+=(8000 8089 9997)
             ;;
         workstation)
             ;;
         *)
-            echo "ERROR: Invalid service."
-            return
+            echo "ERROR: Unknown service."
+            return 1
             ;;
     esac
+}
+
+configure_service() {
+    local service="$1"
+    local port confirm
+    local errors=0
+
+    get_ports "$service" || return
 
     echo
     echo "========== CONFIGURATION SUMMARY =========="
-    echo "Selected Service: $service"
-    echo "Allowed TCP Ports: ${tcp_ports[*]}"
+    echo "Service: $service"
+    echo "Allowed TCP Ports: ${TCP_PORTS[*]}"
     echo "ICMP Ping: Allowed"
+    echo "Loopback: Allowed"
     echo "Established Connections: Allowed"
     echo "Outbound Traffic: Unchanged"
     echo "Default Policies: Unchanged"
     echo
     echo "No custom chains will be created."
-    echo "Existing rules will not be flushed."
-    echo "No firewall configurations will be saved."
+    echo "No existing rules will be flushed."
+    echo "No permanent configurations will be saved."
+    echo
+    echo "WARNING: Rules are inserted at the top of INPUT."
+    echo "They may override existing access restrictions."
     echo
 
-    read -r -p "Apply these firewall rules? (yes/no): " confirm
+    read -r -p "Apply these rules? (yes/no): " confirm
 
-    if [[ "$confirm" != "yes" ]]; then
+    [[ "$confirm" == "yes" ]] || {
         echo "Configuration cancelled."
         return
-    fi
+    }
 
     echo
     echo "========== APPLYING FIREWALL RULES =========="
 
-    # Allow loopback
-    allow_rule INPUT -i lo -j ACCEPT
+    allow_rule INPUT -i lo -j ACCEPT || ((errors+=1))
 
-    # Allow established and related connections
     allow_rule INPUT -m conntrack \
-        --ctstate ESTABLISHED,RELATED -j ACCEPT
+        --ctstate ESTABLISHED,RELATED -j ACCEPT || ((errors+=1))
 
-    # Allow ICMP ping
     allow_rule INPUT -p icmp \
-        --icmp-type echo-request -j ACCEPT
+        --icmp-type echo-request -j ACCEPT || ((errors+=1))
 
-    # Allow scored TCP services
-    for port in "${tcp_ports[@]}"; do
+    for port in "${TCP_PORTS[@]}"; do
         allow_rule INPUT -p tcp \
-            --dport "$port" -j ACCEPT
+            --dport "$port" -j ACCEPT || ((errors+=1))
     done
 
     echo
-    echo "========== CONFIGURATION COMPLETE =========="
-    echo "Firewall rules have been processed."
-    echo
+    echo "========== CONFIGURATION RESULT =========="
+
+    if ((errors == 0)); then
+        echo "[OK] All requested rules were processed."
+    else
+        echo "[WARNING] $errors rule(s) could not be added."
+    fi
+
     echo "No custom chains created."
-    echo "No existing rules flushed."
-    echo "No permanent configurations saved."
+    echo "No rules flushed."
+    echo "No configurations saved."
     echo
     echo "Verify scored services from another machine."
 }
 
-# Check scored Linux services
-check_scoring() {
-    echo
-    echo "========== SCORED LINUX SERVICES =========="
-    echo
-    printf '%-22s %-12s %s\n' \
-        "SERVICE" "PORT" "PROTOCOL"
-    echo "----------------------------------------------"
+# Check whether the configured service ports
+# are listening locally.
+check_service() {
+    local service="$1"
+    local port
 
-    printf '%-22s %-12s %s\n' "SSH" "22" "TCP"
-    printf '%-22s %-12s %s\n' "HTTP" "80" "TCP"
-    printf '%-22s %-12s %s\n' "HTTPS" "443" "TCP"
-    printf '%-22s %-12s %s\n' "SMTP" "25" "TCP"
-    printf '%-22s %-12s %s\n' "Submission" "587" "TCP"
-    printf '%-22s %-12s %s\n' "POP3" "110" "TCP"
-    printf '%-22s %-12s %s\n' "IMAP" "143" "TCP"
-    printf '%-22s %-12s %s\n' "Splunk Web" "8000" "TCP"
-    printf '%-22s %-12s %s\n' "Splunk Management" "8089" "TCP"
-    printf '%-22s %-12s %s\n' "Splunk Indexer" "9997" "TCP"
+    get_ports "$service" || return
 
     echo
-    echo "========== LISTENING PORTS =========="
-    ss -tuln
+    echo "========== SCORED SERVICE CHECK =========="
+    echo "Selected service: $service"
+    echo
+
+    printf '%-12s %-18s\n' "TCP PORT" "LISTENING STATUS"
+    echo "----------------------------------"
+
+    for port in "${TCP_PORTS[@]}"; do
+        if ss -H -ltn | awk '{print $4}' |
+            grep -Eq "[:.]${port}$"; then
+            printf '%-12s %-18s\n' "$port" "[LISTENING]"
+        else
+            printf '%-12s %-18s\n' "$port" "[NOT LISTENING]"
+        fi
+    done
 
     echo
     echo "========== INPUT FIREWALL RULES =========="
     iptables -L INPUT -n -v --line-numbers
 
     echo
-    echo "NOTE: This does not guarantee scoring availability."
-    echo "External connectivity testing is required."
+    echo "NOTE: A listening service may still be blocked"
+    echo "by a firewall or another network control."
+    echo "Some mail services may intentionally listen"
+    echo "only on localhost."
 
     pause
 }
 
-# Check for firewall conflicts
+scoring_menu() {
+    local choice
+
+    while true; do
+        clear
+        echo "=========================================="
+        echo "           SCORED SERVICE CHECK"
+        echo "=========================================="
+        echo "1) E-commerce"
+        echo "2) Roundcube Webmail"
+        echo "3) Splunk"
+        echo "4) Workstation"
+        echo "q) Return to Main Menu"
+        echo "=========================================="
+
+        read -r -p "Select an option: " choice
+
+        case "$choice" in
+            1) check_service ecommerce ;;
+            2) check_service webmail ;;
+            3) check_service splunk ;;
+            4) check_service workstation ;;
+            q|Q) return ;;
+            *) echo "Invalid selection."; sleep 1 ;;
+        esac
+    done
+}
+
 check_conflicts() {
     echo
     echo "========== FIREWALL CONFLICT CHECK =========="
 
     if command -v firewall-cmd >/dev/null 2>&1; then
-        if firewall-cmd --state 2>/dev/null | grep -qx running; then
+        if firewall-cmd --state 2>/dev/null |
+            grep -qx running; then
             echo "[WARNING] firewalld is running."
         else
             echo "[OK] firewalld is not running."
@@ -192,7 +237,8 @@ check_conflicts() {
     fi
 
     if command -v ufw >/dev/null 2>&1; then
-        if ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ufw status 2>/dev/null |
+            grep -q "Status: active"; then
             echo "[WARNING] UFW is active."
         else
             echo "[OK] UFW is not active."
@@ -209,17 +255,26 @@ check_conflicts() {
 
     echo
     echo "========== DROP/REJECT RULES =========="
-    iptables -S INPUT | grep -E -- '-j (DROP|REJECT)' ||
+    iptables -S INPUT |
+        grep -E -- '-j (DROP|REJECT)' ||
         echo "No direct INPUT DROP/REJECT rules found."
 
     echo
-    echo "NOTE: Existing chains and other firewall backends"
-    echo "may still affect traffic."
+    echo "========== IPV6 STATUS =========="
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -S INPUT | head -n 1
+        echo "NOTE: IPv6 rules are not modified."
+    else
+        echo "ip6tables is unavailable."
+    fi
+
+    echo
+    echo "NOTE: Other firewall backends and existing"
+    echo "rules may still affect network traffic."
 
     pause
 }
 
-# Main menu
 while true; do
     clear
 
@@ -228,7 +283,7 @@ while true; do
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Configure E-commerce"
-    echo "3) Configure Webmail"
+    echo "3) Configure Roundcube Webmail"
     echo "4) Configure Splunk"
     echo "5) Configure Workstation"
     echo "6) Check Scored Services"
@@ -259,7 +314,7 @@ while true; do
             pause
             ;;
         6)
-            check_scoring
+            scoring_menu
             ;;
         7)
             check_conflicts
